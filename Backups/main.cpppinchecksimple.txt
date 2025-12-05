@@ -1,0 +1,47 @@
+#include <Arduino.h>          // Basic Needs
+#define dirPinStepper 1
+#define enablePinStepper 0
+#define stepPinStepper 2
+#define LVpin 99
+
+void setup(void) {
+
+    // Initialize serial communication at 115200 baud rate
+    Serial.begin(115200);
+    Serial.println("Setup complete.");
+    pinMode(enablePinStepper, OUTPUT);
+    pinMode(LVpin, OUTPUT);
+    pinMode(dirPinStepper, OUTPUT);
+    pinMode(stepPinStepper, OUTPUT);    
+
+}
+
+void loop(void) {
+
+    // Main loop code
+    Serial.println("Looping...");
+    digitalWrite(enablePinStepper, HIGH);
+    digitalWrite(LVpin, HIGH);
+    digitalWrite(dirPinStepper, HIGH);
+    digitalWrite(stepPinStepper, HIGH);
+    delay(1000); // Wait for 1 second
+    digitalWrite(enablePinStepper, LOW);
+    digitalWrite(LVpin, LOW);
+    digitalWrite(dirPinStepper, LOW);
+    digitalWrite(stepPinStepper, LOW);  
+    delay(1000); // Wait for 1 second
+digitalWrite(enablePinStepper, HIGH);
+delay(1000); // Wait for 1 second
+digitalWrite(enablePinStepper, LOW);
+digitalWrite(dirPinStepper, HIGH);
+delay(1000); // Wait for 1 second       
+digitalWrite(dirPinStepper, LOW);
+digitalWrite(stepPinStepper, HIGH);
+delay(1000); // Wait for 1 second       
+digitalWrite(stepPinStepper, LOW);
+digitalWrite(LVpin, HIGH);
+delay(1000); // Wait for 1 second
+digitalWrite(LVpin, LOW);
+delay(1000); // Wait for 1 second
+
+}

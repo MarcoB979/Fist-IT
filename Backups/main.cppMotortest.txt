@@ -1,0 +1,53 @@
+#include <Arduino.h>
+#include "FastAccelStepper.h"
+
+    #define dirPinStepper 1
+    #define enablePinStepper 0
+    #define stepPinStepper 2
+    //#define LVpin 2
+    
+FastAccelStepperEngine engine = FastAccelStepperEngine();
+FastAccelStepper *stepper = NULL;
+
+void setup(void) {
+  Serial.begin(115200);
+
+
+  engine.init();
+  stepper = engine.stepperConnectToPin(stepPinStepper);
+  if (stepper) {
+    stepper->setDirectionPin(dirPinStepper);
+    stepper->setEnablePin(enablePinStepper);
+    stepper->setAutoEnable(true);
+    // If auto enable/disable need delays, just add (one or both):
+    stepper->setDelayToEnable(50);
+    stepper->setDelayToDisable(60000);
+  }
+    //test to show board works 
+
+    stepper->setSpeedInTicks(900);
+    stepper->setAcceleration(700);
+    stepper->setCurrentPosition(0);
+    stepper->moveTo(0);
+
+}
+
+void loop(void) {
+
+
+    
+    if (stepper->targetPos()==stepper->getCurrentPosition()) {
+    if (stepper->getCurrentPosition()==0) {
+      stepper->moveTo(1000);
+      }else      
+      if (stepper->getCurrentPosition()==1000) {
+        stepper->moveTo(0);
+      }else      
+      if (stepper->getCurrentPosition()<1000) {
+        stepper->moveTo(1000);
+      }else      
+        stepper->moveTo(1000);
+
+    } 
+  
+}

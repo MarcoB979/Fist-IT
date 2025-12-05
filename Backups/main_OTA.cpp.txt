@@ -1,0 +1,593 @@
+#include "FastAccelStepper.h"
+#include <ESPmDNS.h>
+#include <Arduino.h>          // Basic Needs
+#include <esp_now.h>
+
+/////////////////////////////////OTA Part/////////////////////////////////////
+
+#if defined(ESP8266)
+  #include <ESP8266WiFi.h>
+  #include <WiFiClient.h>
+  #include <ESP8266WebServer.h>
+#elif defined(ESP32)
+  #include <WiFi.h>
+  #include <WiFiClient.h>
+  #include <WebServer.h>
+#elif defined(TARGET_RP2040) || defined(TARGET_RP2350) || defined(PICO_RP2040) || defined(PICO_RP2350)
+  #include <WiFi.h>
+  #include <WiFiClient.h>
+  #include <WiFiServer.h>
+  #include <WebServer.h>
+#endif
+
+#include <ElegantOTA.h>
+
+#ifndef STASSID
+#define STASSID "Bechthum"
+#define STAPSK  "Marco-1979"
+#endif
+
+const char *ssid = STASSID;
+const char *password = STAPSK;
+
+#if defined(ESP8266)
+  ESP8266WebServer server(80);
+#elif defined(ESP32)
+  WebServer server(80);
+#elif defined(TARGET_RP2040) || defined(TARGET_RP2350) || defined(PICO_RP2040) || defined(PICO_RP2350)
+  WebServer server(80);
+#endif
+
+unsigned long ota_progress_millis = 0;
+
+/////////////////////////////////FIST-IT part/////////////////////////////////////
+
+
+//#define C3devboard
+#define C3mini
+
+
+#ifdef C3mini
+    #define dirPinStepper 3
+    #define enablePinStepper 4
+    #define stepPinStepper 0
+    #define LVpin 2
+#endif
+
+#ifdef C3devboard
+    #define dirPinStepper 16 //3
+    #define enablePinStepper 4 //1
+    #define stepPinStepper 17 //2
+    #define LVpin 23 //2
+#endif
+
+
+
+FastAccelStepperEngine engine = FastAccelStepperEngine();
+FastAccelStepper *stepper = NULL;
+int pos=0;
+int EndPosition=0;
+int StartPosition=0;
+int speedValue =1;
+int stepsPerRotation = 1800;
+int SensationValue = 100;
+int F_Pause = 0;
+int START=1;
+int STOP=0;
+int MotorStatus=STOP;
+void stopMotor();
+//void driveStepper(int c);
+
+#define FSPEED  30
+#define FROTATION   31
+#define FPAUSE   32
+#define FSENSATION  33
+
+
+///////////////////////////////////////////
+////
+////  To Debug or not to Debug
+////
+///////////////////////////////////////////
+
+// Uncomment the following line if you wish to print DEBUG info
+#define DEBUG 
+
+#ifdef DEBUG
+#define LogDebug(...) Serial.println(__VA_ARGS__)
+#define LogDebugFormatted(...) Serial.printf(__VA_ARGS__)
+#else
+#define LogDebug(...) ((void)0)
+#define LogDebugFormatted(...) ((void)0)
+#endif
+
+#define OSSM 1
+#define FIST 3
+
+#define OSSM_ID  1 //OSSM_ID Default can be changed with M5 Remote in the Future will be Saved in EPROOM
+#define FIST_ID 3 //M5_ID Default can be changed with M5 Remote in the Future will be Saved in EPROOM
+#define M5_ID 99 //M5_ID Default can be changed with M5 Remote in the Future will be Saved in EPROOM
+
+//uint8_t M5_Remote_Address[] = {0xB0, 0xB2, 0x1C, 0x50, 0xF6, 0xDC};
+uint8_t M5_Remote_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+#define OFF 10
+#define ON  11
+
+#define CONNECT 88
+#define HEARTBEAT 99
+
+///////////////////////////////////////////
+////
+////  To Debug or not to Debug
+////
+///////////////////////////////////////////
+
+// Uncomment the following line if you wish to print DEBUG info
+#define DEBUG 
+
+#ifdef DEBUG
+#define LogDebug(...) Serial.println(__VA_ARGS__)
+#define LogDebugFormatted(...) Serial.printf(__VA_ARGS__)
+#else
+#define LogDebug(...) ((void)0)
+#define LogDebugFormatted(...) ((void)0)
+#endif
+
+
+// Variable to store if sending data was successful
+String success;
+
+float out_esp_speed;
+float out_esp_depth;
+float out_esp_stroke;
+float out_esp_sensation;
+float out_esp_pattern;
+bool out_esp_rstate;
+bool out_esp_connected;
+int out_esp_command;
+float out_esp_value;
+int out_esp_target;
+int out_esp_sender;
+
+float incoming_esp_speed;
+float incoming_esp_depth;
+float incoming_esp_stroke;
+float incoming_esp_sensation;
+float incoming_esp_pattern;
+bool incoming_esp_rstate;
+bool incoming_esp_connected;
+bool incoming_esp_heartbeat;
+int incoming_esp_target;
+int incoming_esp_sender;
+
+typedef struct struct_message {
+  float esp_speed;
+  float esp_depth;
+  float esp_stroke;
+  float esp_sensation;
+  float esp_pattern;
+  bool esp_rstate;
+  bool esp_connected;
+  bool esp_heartbeat;
+  int esp_command;
+  float esp_value;
+  int esp_target;
+  int esp_sender;
+} struct_message;
+
+bool M5_paired = false;
+
+struct_message outgoingcontrol;
+struct_message incomingcontrol;
+
+esp_now_peer_info_t peerInfo;
+
+TaskHandle_t eRemote_t  = nullptr;  // Esp Now Remote Task
+//TaskHandle_t eRemote_t_EJECT  = nullptr;  // Esp Now Remote Task
+
+void espNowRemoteTask(void *pvParameters); // Handels the EspNow Remote
+#define HEARTBEAT_INTERVAL 15000/portTICK_PERIOD_MS	// 5 seconds
+
+
+// Callback when data is sent
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("\r\nLast Packet Send Status:\t");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+  if (status ==0){
+    success = "Delivery Success :)";
+  }
+  else{
+    success = "Delivery Fail :(";
+  }
+}
+
+// Callback when data is received
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+Serial.println("Received step 1");
+  memcpy(&incomingcontrol, incomingData, sizeof(incomingcontrol));
+
+  Serial.print("Received Command: ");
+  LogDebug(incomingcontrol.esp_command);
+  Serial.print("Received value: ");
+  LogDebug(incomingcontrol.esp_value);
+  Serial.print("Received to target ID: ");
+  LogDebug(incomingcontrol.esp_target);
+  Serial.print("Received from sender: ");
+  LogDebug(incomingcontrol.esp_sender);
+  LogDebugFormatted("from MAC addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  if(!M5_paired){
+    LogDebug("M5 is not paired");}
+  else{
+    LogDebugFormatted("M5 paired and ready. M5 Remote addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", M5_Remote_Address[0], M5_Remote_Address[1], M5_Remote_Address[2], M5_Remote_Address[3], M5_Remote_Address[4], M5_Remote_Address[5]);
+  }
+  
+  if(incomingcontrol.esp_target == FIST_ID  && 
+     M5_paired == false){
+
+    // Remove the existing peer (0xFF:0xFF:0xFF:0xFF:0xFF:0xFF)
+    esp_err_t result = esp_now_del_peer(peerInfo.peer_addr);
+
+    if (result == ESP_OK) {
+
+      memcpy(M5_Remote_Address, mac, 6); //get the mac address of the sender
+      
+      // Add the new peer
+      memcpy(peerInfo.peer_addr, M5_Remote_Address, 6);
+      if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+        LogDebugFormatted("New peer added successfully, M5 Remote addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", M5_Remote_Address[0], M5_Remote_Address[1], M5_Remote_Address[2], M5_Remote_Address[3], M5_Remote_Address[4], M5_Remote_Address[5]);
+        M5_paired = true;
+      }
+      else {
+        LogDebug("Failed to add new peer");
+      }
+    }
+    else {
+      LogDebug("Failed to remove peer");
+    }
+
+    outgoingcontrol.esp_target = M5_ID;
+    outgoingcontrol.esp_sender = FIST_ID;
+    outgoingcontrol.esp_command = HEARTBEAT;
+
+
+    result = esp_now_send(M5_Remote_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+    LogDebug(result);
+    
+    if (result == ESP_OK) {
+      M5_paired = true;
+      LogDebug("M5 remote Connected");
+    }
+  }
+
+  //if(incomingcontrol.esp_target == FIST_ID){
+    Serial.print("Received command ");
+    LogDebug(incomingcontrol.esp_command);
+
+    switch(incomingcontrol.esp_command)
+    {
+      case FSPEED:
+      {
+        speedValue = incomingcontrol.esp_value * 10;  //value max 100 value 100 * 10 = max speed
+      }
+      break;
+      case FROTATION:
+      {
+        StartPosition = 0 ;
+        EndPosition = (stepsPerRotation/360)*incomingcontrol.esp_value ;  //degrees 0 to xx
+      }
+      break;
+      case FPAUSE:
+      {
+        F_Pause = incomingcontrol.esp_value/10;  //10th of a second
+      }
+      break;
+      case FSENSATION:
+      {
+        SensationValue = incomingcontrol.esp_value * 10; //accelleration value max 100 value 100 * 10 = max accelleration
+      }
+      break;
+      case ON:
+      {
+        //digitalWrite(enablePinStepper, LOW);
+        MotorStatus=START;
+      }
+      break;
+      case OFF:
+      {
+        //digitalWrite(enablePinStepper, HIGH);
+        MotorStatus=STOP;
+      }
+      break;
+      case CONNECT or HEARTBEAT:
+      {
+        outgoingcontrol.esp_target = M5_ID;
+        outgoingcontrol.esp_sender = FIST_ID;
+        outgoingcontrol.esp_command = HEARTBEAT;
+        esp_err_t result = esp_now_send(M5_Remote_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+        LogDebug(result);
+        
+        if (result == ESP_OK) {
+          M5_paired = true;
+          LogDebug("M5 remote Connected");
+        }
+    
+      }
+      break;
+    }
+    Serial.print("Rotation: ");
+    Serial.print(StartPosition);
+    Serial.print(" - ");
+    Serial.println(EndPosition);
+    Serial.print("Motorstatus: ");
+    Serial.println(MotorStatus);
+    Serial.print("Position: ");
+    Serial.println(stepper->getCurrentPosition());
+    Serial.print("Target: ");
+    Serial.println(stepper->targetPos());
+  //}
+}
+
+
+/////////////////////////////////OTA Callbacks/////////////////////////////////////
+
+void onOTAStart() {
+  // Log when OTA has started
+  Serial.println("OTA update started!");
+  // <Add your own code here>
+}
+
+void onOTAProgress(size_t current, size_t final) {
+  // Log every 1 second
+  if (millis() - ota_progress_millis > 1000) {
+    ota_progress_millis = millis();
+    Serial.printf("OTA Progress Current: %u bytes, Final: %u bytes\n", current, final);
+  }
+}
+
+void onOTAEnd(bool success) {
+  // Log when OTA has finished
+  if (success) {
+    Serial.println("OTA update finished successfully!");
+  } else {
+    Serial.println("There was an error during OTA update!");
+  }
+  // <Add your own code here>
+}
+
+/////////////////////////////////OTA Callbacks/////////////////////////////////////
+
+
+
+void setup(void) {
+  Serial.begin(115200);
+  /////////////////////////////////OTA code/////////////////////////////////////
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname("fist-it");
+  WiFi.begin(ssid, password);
+  Serial.println("");
+
+  // Wait for connection
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("Connected to ");
+  Serial.println(ssid);
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", []() {
+    server.send(200, "text/plain", "You have found your Fist-IT device! Please use " + WiFi.localIP().toString() + "/update to update the firmware.");
+  });
+
+  ElegantOTA.begin(&server);    // Start ElegantOTA
+  // ElegantOTA callbacks
+  ElegantOTA.onStart(onOTAStart);
+  ElegantOTA.onProgress(onOTAProgress);
+  ElegantOTA.onEnd(onOTAEnd);
+
+  server.begin();
+  Serial.println("HTTP server started");
+
+
+  /////////////////////////////////FIST-IT code/////////////////////////////////////
+
+  Serial.println("SETUP START");
+
+  pinMode(enablePinStepper, OUTPUT);
+  digitalWrite(enablePinStepper, LOW);
+  pinMode(LVpin, OUTPUT);
+  digitalWrite(LVpin, HIGH);
+    
+  engine.init();
+  stepper = engine.stepperConnectToPin(stepPinStepper);
+  if (stepper) {
+    stepper->setDirectionPin(dirPinStepper);
+    stepper->setEnablePin(enablePinStepper);
+    stepper->setAutoEnable(true);
+    // If auto enable/disable need delays, just add (one or both):
+    // stepper->setDelayToEnable(50);
+    stepper->setDelayToDisable(60000);
+//    stepper->setSpeedInUs(1000);  // the parameter is us/step !!!
+//    stepper->setAcceleration(900);
+
+    StartPosition=0;
+    MotorStatus=STOP;
+  }
+    //test to show board works 
+
+    Serial.begin(115200);
+    WiFi.mode(WIFI_STA);
+    Serial.print("MAC Address Fist-IT: ");
+    Serial.println(WiFi.macAddress());
+    LogDebug(WiFi.macAddress());
+    server.on("/", []() {
+    server.send(200, "text/plain", "This is the MAC Address of your Fist-IT: " + WiFi.macAddress());
+    });
+    
+    //test to show board works 
+
+    stepper->setSpeedInTicks(1000);
+    stepper->moveTo(0);
+    stepper->moveTo(stepsPerRotation);
+
+    server.on("/", []() {
+    server.send(200, "text/plain", "Testing the stepper motor. It should move now.");
+    });
+
+
+    // Init ESP-NOW
+    if (esp_now_init() != ESP_OK) {
+      Serial.println("Error initializing ESP-NOW");
+      return;
+      }
+    if (esp_now_init() == ESP_OK) {
+    server.on("/", []() {
+    server.send(200, "text/plain", "ESP_NOW is succesfully initialized.");
+    });
+      }
+      // Once ESPNow is successfully Init, we will register for Send CB to
+      // get the status of Trasnmitted packet
+      esp_now_register_send_cb(OnDataSent);
+
+      
+  xTaskCreatePinnedToCore(espNowRemoteTask,      /* Task function. */
+    "espNowRemoteTask",  /* name of task. */
+    3096,               /* Stack size of task */
+    NULL,               /* parameter of the task */
+    5,                  /* priority of the task */
+    &eRemote_t,         /* Task handle to keep track of created task */
+    0);                 /* pin task to core 0 */
+  
+      // Register peer
+      memcpy(peerInfo.peer_addr, M5_Remote_Address, 6);
+      peerInfo.channel = 0;  
+      peerInfo.encrypt = false;
+    
+        // Add peer        
+      if (esp_now_add_peer(&peerInfo) != ESP_OK){
+        Serial.println("Failed to add peer");
+        return;}
+      else{
+        server.on("/", []() {
+        server.send(200, "text/plain", "Testing the stepper motor. It should move now.");
+        });
+      }  
+      
+      // Register for a callback function that will be called when data is received
+      esp_now_register_recv_cb(OnDataRecv);
+
+    //Send first heartbeat to M5 remote
+
+    if(!M5_paired){
+      //server.send(200, "text/plain", "Establishing connection to the M5 Remote.");
+      LogDebug("Sending first heartbeat");
+      LogDebugFormatted("to M5 remote addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", M5_Remote_Address[0], M5_Remote_Address[1], M5_Remote_Address[2], M5_Remote_Address[3], M5_Remote_Address[4], M5_Remote_Address[5]);
+
+      outgoingcontrol.esp_command = HEARTBEAT;
+      outgoingcontrol.esp_heartbeat = true;
+      outgoingcontrol.esp_target = M5_ID;
+      outgoingcontrol.esp_sender = FIST_ID;
+      esp_err_t result = esp_now_send(M5_Remote_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+      if (result == !ESP_OK) {
+        LogDebug("Sending to M5 failed (not paired)");
+      }
+
+    }
+    //test to show board works 
+    if(M5_paired){
+        server.on("/", []() {
+        server.send(200, "text/plain", "Testing the stepper motor. It should move now.");
+        });
+    }  
+
+
+
+}
+
+void loop(void) {
+  /////////////////////////////////OTA code/////////////////////////////////////
+
+  server.handleClient();
+  ElegantOTA.loop();
+
+
+  /////////////////////////////////FIST-IT code/////////////////////////////////////
+
+  //  server.handleClient();
+  stepper->setSpeedInTicks((speedValue*10));  // the parameter is us/step !!!
+  stepper->setAcceleration((speedValue*(SensationValue/100)));
+
+
+    if (stepper->targetPos()==stepper->getCurrentPosition()) {
+    if (stepper->getCurrentPosition()==0) {
+      stepper->moveTo(1000);
+      }else      
+      if (stepper->getCurrentPosition()==1000) {
+        stepper->moveTo(0);
+      }else      
+      if (stepper->getCurrentPosition()<1000) {
+        stepper->moveTo(1000);
+      }else      
+        stepper->moveTo(1000);
+
+    } 
+
+
+  if (MotorStatus==START){
+
+    
+    if (stepper->targetPos()==stepper->getCurrentPosition()) {
+    delay(F_Pause*1000);
+    if (stepper->getCurrentPosition()==StartPosition) {
+      stepper->moveTo(EndPosition);
+      }else      
+      if (stepper->getCurrentPosition()==EndPosition) {
+        stepper->moveTo(StartPosition);
+      }else      
+      if (stepper->getCurrentPosition()<EndPosition) {
+        stepper->moveTo(EndPosition);
+      }else      
+        stepper->moveTo(EndPosition);
+
+    } 
+} else if (MotorStatus==STOP){
+  //digitalWrite(enablePinStepper, HIGH);
+  stepper->forceStopAndNewPosition(0);
+//  stepper->setCurrentPosition(0);
+  stepper->moveTo(0);
+}
+}//end of loop
+
+void stopMotor() {
+  MotorStatus=STOP;
+}
+
+
+void espNowRemoteTask(void *pvParameters)
+{
+  for(;;){
+      if(M5_paired){
+      //server.send(200, "text/plain", "M5 Remo0te is still paired at " + String(millis()/1000) + " seconds."); 
+      LogDebug("Heartbeat to M5");
+//      LogDebugFormatted("OSSM addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", OSSM_Address[0], OSSM_Address[1], OSSM_Address[2], OSSM_Address[3], OSSM_Address[4], OSSM_Address[5]);
+      outgoingcontrol.esp_command = HEARTBEAT;
+      outgoingcontrol.esp_sender = FIST_ID;
+      outgoingcontrol.esp_heartbeat = true;
+      outgoingcontrol.esp_target = M5_ID;
+      esp_err_t result = esp_now_send(M5_Remote_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+      if (result == ESP_OK) {
+//        LogDebug("Sent ok");
+      } 
+      else {
+        LogDebug("failed to send heartbeat");
+      }
+
+    }
+    delay(200);
+    //problem when adding if eject not paired
+    vTaskDelay(HEARTBEAT_INTERVAL);
+  }
+}
