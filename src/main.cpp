@@ -4,9 +4,12 @@
 
 #include "FastAccelStepper.h"
 #include <Arduino.h>          // Basic Needs
-#include <esp_now.h>
 #include <WiFi.h>
-#include <esp_wifi.h>
+#include <wifi.h>
+#include <NimBLEDevice.h>
+#if defined(ESP32)
+#include <esp_log.h>
+#endif
 #include <ESPmDNS.h>
 #include <WiFiManager.h> // WiFiManager library for automatic WiFi configuration
 
@@ -59,7 +62,7 @@ int32_t getWiFiChannel(const char *ssid) {
 
 //#define C3devboard
 #define C3mini
-
+//#define C3miniV2
 
 #ifdef C3mini
     #define dirPinStepper 1
@@ -76,6 +79,13 @@ int32_t getWiFiChannel(const char *ssid) {
 #endif
 
 
+#ifdef C3miniV2
+    #define dirPinStepper 1
+    #define enablePinStepper 10
+    #define stepPinStepper 0
+    #define LVpin 99
+
+#endif
 
 FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper *stepper = NULL;
@@ -83,11 +93,11 @@ int pos=0;
 int EndPosition=0;
 int StartPosition=0;
 int speedValue =1;
-int stepsPerRotation = 1800;
+int stepsPerRotation = 3600;
 int SensationValue = 100;
-float lastSensationPercent = 100.0f; // Default to 100% if not set by FSENSATION
-float sensationScale = 1.5f; // Default: 1.0 (100% of requested percentage)
 int F_Pause = 0;
+int strokeSpeedSetting = 1;
+int strokeAccelSetting = 100;
 int START=1;
 int STOP=0;
 int IDLE=444;
@@ -95,9 +105,19 @@ int ANGLE_MODE=555;
 int MotorStatus=IDLE;
 String Direction="";
 
-int minSpeedHz = 20;   // Minimum speed in Hz
-int maxSpeedHz = 50000;  // Maximum speed in Hz
-int baseAcceleration = 15000;
+const int STROKE_SPEED_MIN_SETTING = 1;
+const int STROKE_SPEED_MAX_SETTING = 100;
+const int STROKE_ACCEL_MIN_SETTING = 0;
+const int STROKE_ACCEL_MAX_SETTING = 100;
+
+// Tune these values to shape the M5 stroke-mode behavior.
+const int STROKE_SPEED_SLOWEST_SPS = 50;
+const int STROKE_SPEED_FASTEST_SPS = 20000;
+const int STROKE_ACCEL_MIN_VALUE = 10;
+const int STROKE_ACCEL_MAX_VALUE = 25000;
+// At 100% accel setting: finalAccel = speedSps * this multiplier.
+// 1.0 means accel equals speed (roughly 1 second to reach target speed).
+const float STROKE_ACCEL_SPEED_MULTIPLIER = 1.0f;
 
 #define FSPEED  30
 #define FROTATION   31
@@ -123,14 +143,6 @@ int baseAcceleration = 15000;
 #define FIST_IT_GYRO_ID 4 //Fist-IT Gyro Controller ID
 #define M5_ID 99 //M5_ID Default can be changed with M5 Remote in the Future will be Saved in EPROOM
 
-uint8_t DEFAULT_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Broadcast to all ESP32s, upon connection gets updated to the actual address
-uint8_t M5_Remote_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-//uint8_t M5_Remote_Address[] = {0xB0, 0xB2, 0x1C, 0x50, 0xF6, 0xDC};
-
-// OSSM STROKE ENGINE CONNECTION
-uint8_t OSSM_Address[] = {0xC0, 0x5D, 0x89, 0xB3, 0xDA, 0xFC}; // OSSM MAC address from M5 Remote code
-uint8_t FIST_IT_RC_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Fist-IT Remote Controller address
-
 #define OFF 10
 #define ON  11
 
@@ -145,7 +157,7 @@ uint8_t FIST_IT_RC_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Fist-IT 
 
 // Uncomment the following line if you wish to print DEBUG info
 
-//#define DEBUG 
+#define DEBUG 
 
 #ifdef DEBUG
 #define LogDebug(...) Serial.println(__VA_ARGS__)
@@ -169,44 +181,44 @@ uint8_t FIST_IT_RC_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Fist-IT 
 
 
 // Variable to store if sending data was successful
-String success = "";
+String success;
 
-float out_esp_speed;
-float out_esp_depth;
-float out_esp_stroke;
-float out_esp_sensation;
-float out_esp_pattern;
-bool out_esp_rstate;
-bool out_esp_connected;
-int out_esp_command;
-float out_esp_value;
-int out_esp_target;
-int out_esp_sender;
+float out_speed;
+float out_depth;
+float out_stroke;
+float out_sensation;
+float out_pattern;
+bool out_rstate;
+bool out_connected;
+int out_command;
+float out_value;
+int out_target;
+int out_sender;
 
-float incoming_esp_speed;
-float incoming_esp_depth;
-float incoming_esp_stroke;
-float incoming_esp_sensation;
-float incoming_esp_pattern;
-bool incoming_esp_rstate;
-bool incoming_esp_connected;
-bool incoming_esp_heartbeat;
-int incoming_esp_target;
-int incoming_esp_sender;
+float incoming_speed;
+float incoming_depth;
+float incoming_stroke;
+float incoming_sensation;
+float incoming_pattern;
+bool incoming_rstate;
+bool incoming_connected;
+bool incoming_heartbeat;
+int incoming_target;
+int incoming_sender;
 
 typedef struct struct_message {
-  float esp_speed;
-  float esp_depth;
-  float esp_stroke;
-  float esp_sensation;
-  float esp_pattern;
-  bool esp_rstate;
-  bool esp_connected;
-  bool esp_heartbeat;
-  int esp_command;
-  float esp_value;
-  int esp_target;
-  int esp_sender;
+  float speed;
+  float depth;
+  float stroke;
+  float sensation;
+  float pattern;
+  bool rstate;
+  bool connected;
+  bool heartbeat;
+  int command;
+  float value;
+  int target;
+  int sender;
 } struct_message;
 
 bool M5_paired = false;
@@ -225,13 +237,22 @@ unsigned long lastM5CommandTime = 0;
 unsigned long lastGyroCommandTime = 0;
 const unsigned long DEVICE_TIMEOUT = 2000; // 2 seconds timeout for device priority
 
-struct_message outgoingcontrol;
-struct_message incomingcontrol;
+struct_message outgoing;
+struct_message incoming;
 
-esp_now_peer_info_t peerInfo;  // Single dynamic peer info
-#define HEARTBEAT_INTERVAL 15000/portTICK_PERIOD_MS	// 5 seconds
-TaskHandle_t eRemote_t  = nullptr;  // Esp Now Remote Task
-void espNowRemoteTask(void *pvParameters);
+#define HEARTBEAT_INTERVAL_MS 5000UL
+
+static const char *FIST_BLE_DEVICE_NAME = "Fist-IT";
+static const char *FIST_BLE_SERVICE_UUID = "5f8bb6f0-9f17-4aa8-9c42-3d8b8b4d9001";
+static const char *FIST_BLE_RX_UUID = "5f8bb6f1-9f17-4aa8-9c42-3d8b8b4d9001";
+static const char *FIST_BLE_TX_UUID = "5f8bb6f2-9f17-4aa8-9c42-3d8b8b4d9001";
+
+NimBLEServer *g_bleServer = nullptr;
+NimBLECharacteristic *g_bleRxChar = nullptr;
+NimBLECharacteristic *g_bleTxChar = nullptr;
+volatile bool g_bleClientConnected = false;
+volatile bool g_bleMessagePending = false;
+unsigned long g_lastHeartbeatMs = 0;
 
 
 
@@ -263,228 +284,189 @@ void onOTAEnd(bool success) {
 
 /////////////////////////////////OTA Callbacks/////////////////////////////////////
 
-// OSSM STROKE ENGINE COMMUNICATION
-bool SendOSSMCommand(int command, float value) {
-  if (!OSSM_paired) {
-    LogDebug("OSSM not paired - attempting to connect");
-    
-    // Try to pair with OSSM by sending heartbeat
-    struct_message ossmMessage;
-    memset(&ossmMessage, 0, sizeof(ossmMessage));
-    ossmMessage.esp_command = HEARTBEAT;
-    ossmMessage.esp_heartbeat = true;
-    ossmMessage.esp_target = OSSM_ID;
-    ossmMessage.esp_sender = FIST_ID;
-    
-    esp_err_t result = esp_now_send(OSSM_Address, (uint8_t *) &ossmMessage, sizeof(ossmMessage));
-    if (result == ESP_OK) {
-      LogDebug("OSSM heartbeat sent for pairing");
-    }
+static bool sendBleMessage(const struct_message &msg) {
+  if (!g_bleClientConnected || g_bleTxChar == nullptr) {
+    LogDebugFormatted("BLE TX SKIP cmd=%d val=%.3f target=%d sender=%d connected=%d heartbeat=%d\\n",
+                      msg.command,
+                      msg.value,
+                      msg.target,
+                      msg.sender,
+                      msg.connected ? 1 : 0,
+                      msg.heartbeat ? 1 : 0);
     return false;
   }
-  
-  // Send command to paired OSSM
-  struct_message ossmMessage;
-  memset(&ossmMessage, 0, sizeof(ossmMessage));
-  ossmMessage.esp_connected = true;
-  ossmMessage.esp_command = command;
-  ossmMessage.esp_value = value;
-  ossmMessage.esp_target = OSSM_ID;
-  ossmMessage.esp_sender = FIST_ID;
-  
-  esp_err_t result = esp_now_send(OSSM_Address, (uint8_t *) &ossmMessage, sizeof(ossmMessage));
-  if (result == ESP_OK) {
-    LogDebugFormatted("OSSM command sent: CMD=%d, VALUE=%.2f, MAC ADDRESS: %02X:%02X:%02X:%02X:%02X:%02X\n", command, value, OSSM_Address[0], OSSM_Address[1], OSSM_Address[2], OSSM_Address[3], OSSM_Address[4], OSSM_Address[5] );
-    return true;
-  } else {
-    LogDebugFormatted("Failed to send OSSM command: CMD=%d\n", command);
-    return false;
-  }
+  LogDebugFormatted("BLE TX cmd=%d val=%.3f target=%d sender=%d connected=%d heartbeat=%d\\n",
+                    msg.command,
+                    msg.value,
+                    msg.target,
+                    msg.sender,
+                    msg.connected ? 1 : 0,
+                    msg.heartbeat ? 1 : 0);
+  g_bleTxChar->setValue((uint8_t *)&msg, sizeof(msg));
+  g_bleTxChar->notify();
+  return true;
 }
 
-
-// Callback when data is sent
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-/*
-  LogDebugFormatted("\r\nLast Packet Send Status:\t");
-  LogDebugFormatted(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
-  LogDebugFormatted("Targert MAC addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-  LogDebugFormatted("outgoing target ID : %d\n", outgoingcontrol.esp_target);
-  LogDebugFormatted("outgoing sender ID : %d\n", outgoingcontrol.esp_sender);
-  LogDebugFormatted("outgoing command : %d\n", outgoingcontrol.esp_command);
-*/
-
-  if (status ==0){
-    success = "Delivery Success :)";
-  }
-  else{
-    success = "Delivery Fail :(";
-  }
+static int clampInt(int value, int minValue, int maxValue) {
+  if (value < minValue) return minValue;
+  if (value > maxValue) return maxValue;
+  return value;
 }
 
-// Callback when data is received
-void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
-LogDebug("Received step 1");
-  memcpy(&incomingcontrol, incomingData, sizeof(incomingcontrol));
+static int mapStrokeSpeedSpsFromSetting(int setting) {
+  const int clampedSetting = clampInt(setting, STROKE_SPEED_MIN_SETTING, STROKE_SPEED_MAX_SETTING);
+  const int inputSpan = STROKE_SPEED_MAX_SETTING - STROKE_SPEED_MIN_SETTING;
+  if (inputSpan <= 0) {
+    return STROKE_SPEED_SLOWEST_SPS;
+  }
 
-  // Unconditional debug output for sender and speed
-  LogDebugPRIO(String("[OnDataRecv] esp_sender: ") + String(incomingcontrol.esp_sender) + ", esp_speed: " + String(incomingcontrol.esp_speed));
+  const long outputSpan = (long)STROKE_SPEED_FASTEST_SPS - (long)STROKE_SPEED_SLOWEST_SPS;
+  const long offset = (long)(clampedSetting - STROKE_SPEED_MIN_SETTING) * outputSpan / inputSpan;
+  return (int)((long)STROKE_SPEED_SLOWEST_SPS + offset);
+}
 
+// FastAccelStepper expects speed in microseconds-per-step, so we convert at the final API boundary.
+static int convertStrokeSpeedSpsToTickUs(int speedSps) {
+  if (speedSps <= 0) {
+    return 20000;
+  }
+  int speedUs = (int)((1000000.0f / (float)speedSps) + 0.5f);
+  if (speedUs < 1) speedUs = 1;
+  return speedUs;
+}
 
-    // Debug for M5 remote commands
-    if (incomingcontrol.esp_sender == M5_ID) {
-      LogDebugPRIO("[M5 DEBUG] Command received from M5 remote");
-      LogDebugPRIO(String("[M5 DEBUG] esp_command: ") + String(incomingcontrol.esp_command));
-      LogDebugPRIO(String("[M5 DEBUG] esp_value: ") + String(incomingcontrol.esp_value));
-      LogDebugPRIO(String("[M5 DEBUG] esp_speed: ") + String(incomingcontrol.esp_speed));
-      LogDebugPRIO(String("[M5 DEBUG] esp_sensation: ") + String(incomingcontrol.esp_sensation));
-      LogDebugPRIO(String("[M5 DEBUG] activeController: ") + String(activeController));
+static int calculateStrokeAccelFromSpeed(int accelSetting, int speedSps) {
+  const int clampedSetting = clampInt(accelSetting, STROKE_ACCEL_MIN_SETTING, STROKE_ACCEL_MAX_SETTING);
+  const int minSpeedSps = (STROKE_SPEED_SLOWEST_SPS < STROKE_SPEED_FASTEST_SPS) ? STROKE_SPEED_SLOWEST_SPS : STROKE_SPEED_FASTEST_SPS;
+  const int maxSpeedSps = (STROKE_SPEED_SLOWEST_SPS < STROKE_SPEED_FASTEST_SPS) ? STROKE_SPEED_FASTEST_SPS : STROKE_SPEED_SLOWEST_SPS;
+  const int safeSpeedSps = clampInt(speedSps, minSpeedSps, maxSpeedSps);
+  const float accelPercent = (float)clampedSetting / 100.0f;
+  const float accelFromSpeed = ((float)safeSpeedSps) * accelPercent * STROKE_ACCEL_SPEED_MULTIPLIER;
+  int finalAccel = (int)(accelFromSpeed + 0.5f);
+  finalAccel = clampInt(finalAccel, STROKE_ACCEL_MIN_VALUE, STROKE_ACCEL_MAX_VALUE);
+  return finalAccel;
+}
+
+class FistBleServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override {
+    (void)pServer;
+    (void)connInfo;
+    g_bleClientConnected = true;
+    LogDebugPRIO("BLE client connected");
+  }
+
+  void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason) override {
+    (void)pServer;
+    (void)connInfo;
+    (void)reason;
+    g_bleClientConnected = false;
+    M5_paired = false;
+    NimBLEDevice::startAdvertising();
+    LogDebugPRIO("BLE client disconnected");
+  }
+};
+
+class FistBleRxCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override {
+    (void)connInfo;
+    std::string value = pCharacteristic->getValue();
+    if (value.size() != sizeof(struct_message)) {
+      LogDebugFormatted("BLE RX invalid size: %d (expected %d)\n", (int)value.size(), (int)sizeof(struct_message));
+      return;
     }
 
-    // Use received esp_speed for motor control (minimal change)
-    if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID && incomingcontrol.esp_speed > 0.0f) {
-      currentRotationVelocity = incomingcontrol.esp_speed;
-      LogDebugPRIO(String("Received gyro speed: ") + String(currentRotationVelocity));
-      LogDebugPRIO(String("Received FANGLE value: ") + String(incomingcontrol.esp_value));
-    }
+    memcpy(&incoming, value.data(), sizeof(incoming));
+    g_bleMessagePending = true;
+  }
+};
 
-  LogDebug("Received Command: ");
-  LogDebug(incomingcontrol.esp_command);
-  LogDebug("Received value: ");
-  LogDebug(incomingcontrol.esp_value);
-  LogDebug("Received to target ID: ");
-  LogDebug(incomingcontrol.esp_target);
-  LogDebug("Received from sender: ");
-  LogDebug(incomingcontrol.esp_sender);
-  LogDebugFormatted("from MAC addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+// Callback when data is received over BLE
+void OnDataRecv() {
+  LogDebugFormatted("BLE RX Command: %d, value: %.2f, target: %d, sender: %d\n",
+                    incoming.command,
+                    incoming.value,
+                    incoming.target,
+                    incoming.sender);
 
+  if(incoming.target != FIST_ID && incoming.target != 0) {
+    LogDebugFormatted("Received BLE data not intended for this device (target ID: %d), ignoring.\n", incoming.target);
+    return;
+  }
 
+  if (incoming.sender == M5_ID && !M5_paired) {
+    M5_paired = true;
+    LogDebugPRIO("M5 Remote Connected over BLE");
+  } else if (incoming.sender == FIST_IT_GYRO_ID && !FIST_IT_RC_paired) {
+    FIST_IT_RC_paired = true;
+    LogDebugPRIO("Fist-IT RC Connected over BLE");
+  }
+    
   // SMART PEER MANAGEMENT: Only add peer if not already paired
-  if(incomingcontrol.esp_target == FIST_ID) {
-    
-    bool needToAddPeer = false;
-    
-    if (incomingcontrol.esp_sender == M5_ID && !M5_paired) {
-      // M5 Remote trying to connect for first time
-      esp_now_del_peer(peerInfo.peer_addr); // Clear any existing peer
-      memcpy(M5_Remote_Address, mac, 6);
-      memcpy(peerInfo.peer_addr, mac, 6);
-      needToAddPeer = true;
-      LogDebugPRIO("Setting up M5 Remote peer");
-    }
-    else if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID && !FIST_IT_RC_paired) {
-      // Fist-IT RC trying to connect for first time
-      esp_now_del_peer(peerInfo.peer_addr); // Clear any existing peer
-      memcpy(FIST_IT_RC_Address, mac, 6);
-      memcpy(peerInfo.peer_addr, mac, 6);
-      needToAddPeer = true;
-      LogDebugPRIO("Setting up Fist-IT RC peer");
-      LogDebugFormattedPRIO("Gyro MAC received: %02X:%02X:%02X:%02X:%02X:%02X\n", 
-                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    }
-    else if (incomingcontrol.esp_sender == M5_ID && M5_paired) {
-      // M5 is already paired, just switch to its peer address
-      memcpy(peerInfo.peer_addr, M5_Remote_Address, 6);
-      LogDebugPRIO("Switching to M5 Remote peer");
-    }
-    else if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID && FIST_IT_RC_paired) {
-      // Fist-IT RC is already paired, just switch to its peer address
-      memcpy(peerInfo.peer_addr, FIST_IT_RC_Address, 6);
-      LogDebugPRIO("Switching to Fist-IT RC peer");
-    }
-    
-    if (needToAddPeer) {
-      peerInfo.channel = 1;
-      peerInfo.encrypt = false;
-      
-      esp_err_t result = esp_now_add_peer(&peerInfo);
-      if (result == ESP_OK) {
-        LogDebugFormattedPRIO("Peer added: %02X:%02X:%02X:%02X:%02X:%02X from ID %d\n", 
-                          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], incomingcontrol.esp_sender);
-        
-        if (incomingcontrol.esp_sender == M5_ID) {
-          M5_paired = true;
-          LogDebugPRIO("M5 Remote Connected");
-        } 
-        else if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID) {
-          FIST_IT_RC_paired = true;
-          LogDebugPRIO("Fist-IT RC Connected");
-        }
-        else if (incomingcontrol.esp_sender == OSSM_ID) {
-          OSSM_paired = true;
-          LogDebug("OSSM Stroke Engine Connected!");
-        }
-      }
-      else {
-        LogDebugPRIO("Failed to add peer");
-      }
-    }
-    // End peer management block
+  if(incoming.target == FIST_ID) {
+
     // Process commands from any paired device
-    LogDebug("Received command ");
-    LogDebug(incomingcontrol.esp_command);
-    LogDebug("Received value ");
-    LogDebug(incomingcontrol.esp_value);
+    LogDebugFormatted("Received command FOR FIST-IT from paired device: %d, value %.2f\n", incoming.command, incoming.value);
     
     // ALWAYS ALLOW CONNECTION COMMANDS - they establish communication
-    if (incomingcontrol.esp_command == CONNECT) {
-      LogDebugFormatted("CONNECT command from device %d\n", incomingcontrol.esp_sender);
+    if (incoming.command == CONNECT) {
+      LogDebugFormatted("CONNECT command from device %d\n", incoming.sender);
       
       // Send immediate response to establish connection
-      outgoingcontrol.esp_command = HEARTBEAT; 
-      outgoingcontrol.esp_value = 1.0f;
-      outgoingcontrol.esp_target = incomingcontrol.esp_sender;
-      outgoingcontrol.esp_sender = FIST_ID;
-      outgoingcontrol.esp_connected = true;
-      esp_now_send(mac, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
-      LogDebugFormatted("CONNECT response sent to device %d\n", incomingcontrol.esp_sender);
+      outgoing.command = HEARTBEAT; 
+      outgoing.value = 1.0f;
+      outgoing.target = incoming.sender;
+      outgoing.sender = FIST_ID;
+      outgoing.connected = true;
+      sendBleMessage(outgoing);
+      LogDebugFormatted("CONNECT response sent to device %d\n", incoming.sender);
       return; // Don't process as other commands
     }
     
     // ALWAYS ALLOW SAFETY STATUS UPDATES - they bypass all safety checks
-    if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID && incomingcontrol.esp_command == FSTOP) {
-      gyroSafetyEngaged = (incomingcontrol.esp_value > 0.5f); // 1=SAFE, 0=ACTIVE
+    if (incoming.sender == FIST_IT_GYRO_ID && incoming.command == FSTOP) {
+      gyroSafetyEngaged = (incoming.value > 0.5f); // 1=SAFE, 0=ACTIVE
       LogDebugFormatted("SAFETY: Gyro safety %s\n", gyroSafetyEngaged ? "ENGAGED" : "RELEASED");
       
       // Send acknowledgment back to gyro to confirm connection
-      outgoingcontrol.esp_command = FSTOP;
-      outgoingcontrol.esp_value = gyroSafetyEngaged ? 1.0f : 0.0f;
-      outgoingcontrol.esp_target = FIST_IT_GYRO_ID;
-      outgoingcontrol.esp_sender = FIST_ID;
-      esp_now_send(mac, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+      outgoing.command = FSTOP;
+      outgoing.value = gyroSafetyEngaged ? 1.0f : 0.0f;
+      outgoing.target = FIST_IT_GYRO_ID;
+      outgoing.sender = FIST_ID;
+      sendBleMessage(outgoing);
       return; // Don't process as movement command
     }
     
     // ALWAYS SEND ACKNOWLEDGMENTS FOR CONNECTION HEARTBEATS
-    if (incomingcontrol.esp_heartbeat) {
+    if (incoming.heartbeat) {
+      LogDebugFormatted("HEARTBEAT received from device %d. replying with heartbeat\n", incoming.sender);
       // Send heartbeat response to confirm connection is alive
-      outgoingcontrol.esp_heartbeat = true;
-      outgoingcontrol.esp_connected = true;
-      outgoingcontrol.esp_target = incomingcontrol.esp_sender;
-      outgoingcontrol.esp_sender = FIST_ID;
-      esp_now_send(mac, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
-      LogDebugFormattedPRIO("Heartbeat response sent to device %d\n", incomingcontrol.esp_sender);
+      outgoing.heartbeat = true;
+      outgoing.connected = true;
+      outgoing.target = incoming.sender;
+      outgoing.sender = FIST_ID;
+      sendBleMessage(outgoing);
+      LogDebugFormattedPRIO("Heartbeat response sent to device %d\n", incoming.sender);
     }
     
     // SAFETY SYSTEM: Check if movement commands should be processed
     bool allowMovementCommand = true;
     unsigned long currentTime = millis();
     
-    if (incomingcontrol.esp_sender == M5_ID) {
+    if (incoming.sender == M5_ID) {
       // M5 Remote always has movement priority
       lastM5CommandTime = currentTime;
       activeController = M5_ID;
       LogDebug("SAFETY: M5 Remote active - has priority control");
       
       // Check if M5 is sending a stop command (zero velocity)
-      bool isStopCommand = (abs(incomingcontrol.esp_value) < 0.01f);
+      bool isStopCommand = (abs(incoming.value) < 0.01f);
       if (isStopCommand) {
         // Stop command - clear M5 activity to allow gyro control later
         lastM5CommandTime = 0;
         LogDebug("SAFETY: M5 Remote STOP - clearing priority for gyro connection");
       }
     } 
-    else if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID) {
+    else if (incoming.sender == FIST_IT_GYRO_ID) {
       lastGyroCommandTime = currentTime;
       
       // Check if gyro movement should be blocked by safety system
@@ -511,247 +493,371 @@ LogDebug("Received step 1");
       return;
     }
 
-    // --- Minimal Command Execution ---
-    switch(incomingcontrol.esp_command)
+    switch(incoming.command)
     {
-      case FSPEED: {
-        float m5SpeedRaw = incomingcontrol.esp_value;
-        speedValue = m5SpeedRaw / 100.0f * maxSpeedHz;
-        // Recalculate SensationValue using lastSensationPercent and sensationScale
-        SensationValue = (int)(speedValue * (lastSensationPercent / 100.0f) * sensationScale);
-        LogDebugPRIO(String("[M5 DEBUG] SPEED: raw=") + String(m5SpeedRaw) + ", mapped speedValue=" + String(speedValue) + ", SensationValue recalculated=" + String(SensationValue) + " (" + String(lastSensationPercent) + "% of speedValue, scale=" + String(sensationScale) + ")");
-        break;
+      case FSPEED:
+      {
+        strokeSpeedSetting = clampInt((int)incoming.value, STROKE_SPEED_MIN_SETTING, STROKE_SPEED_MAX_SETTING);
+        speedValue = strokeSpeedSetting;
+        LogDebug("Speed Value set to: "); 
+        LogDebug(speedValue);
+
       }
-      case SPEED: {
-        float m5SpeedRaw = incomingcontrol.esp_value;
-        speedValue = m5SpeedRaw / 100.0f * maxSpeedHz;
-        // Recalculate SensationValue using lastSensationPercent and sensationScale
-        SensationValue = (int)(speedValue * (lastSensationPercent / 100.0f) * sensationScale);
-        LogDebugPRIO(String("[M5 DEBUG] SPEED: raw=") + String(m5SpeedRaw) + ", mapped speedValue=" + String(speedValue) + ", SensationValue recalculated=" + String(SensationValue) + " (" + String(lastSensationPercent) + "% of speedValue, scale=" + String(sensationScale) + ")");
-        break;
+      break;
+      case FROTATION:
+      {
+        StartPosition = 0 ;
+        EndPosition = (stepsPerRotation/360)*incoming.value ;  //degrees 0 to xx
       }
-/*      case DEPTH: {
-        float depthMM = incomingcontrol.esp_value;
-        int depthSteps = (int)(depthMM * (stepsPerRotation / 100.0));
-        StartPosition = 0;
-        EndPosition = depthSteps;
-        LogDebugPRIO(String("DEPTH command: StartPosition=0, EndPosition=") + String(EndPosition));
-        break;
+      break;
+      case FPAUSE:
+      {
+        F_Pause = incoming.value;  //10th of a second
       }
-      case STROKE: {
-        float strokeMM = incomingcontrol.esp_value;
-        int strokeSteps = (int)(strokeMM * (stepsPerRotation / 100.0));
-        StartPosition = 0;
-        EndPosition = strokeSteps;
-        LogDebugPRIO(String("STROKE command: StartPosition=0, EndPosition=") + String(EndPosition));
-        break;
+      break;
+      case FSENSATION:
+      {
+        strokeAccelSetting = clampInt((int)incoming.value, STROKE_ACCEL_MIN_SETTING, STROKE_ACCEL_MAX_SETTING);
+        SensationValue = strokeAccelSetting;
+        LogDebug("Sensation Value set to: "); 
+        LogDebug(SensationValue);
+
       }
-*/      
-      case FROTATION: {
-        LogDebugPRIO("FROTATION command received");
-        StartPosition = 0;
-        // Multiply degrees by 2 for DIP settings, then map to steps
-        EndPosition = (int)((stepsPerRotation/360.0) * (incomingcontrol.esp_value * 2));
-        MotorStatus = ANGLE_MODE;
-        break;
+      break;
+      case FANGLE:
+      {
+        // SAFETY: Constrain angle to safe range (-90° to +90° for human safety)
+        float safeAngle = incoming.value;
+        if (safeAngle > 90.0) safeAngle = 90.0;
+        if (safeAngle < -90.0) safeAngle = -90.0;
+        
+        // DIRECTION FIX: Invert angle so left gyro movement = left motor movement
+        safeAngle = -safeAngle;
+        
+        // USER CONFIGURABLE AMPLIFICATION: Apply rotation scale (0.75x to 1.5x)
+        safeAngle = safeAngle * rotationScale;
+        
+        // Convert to steps with safety check - use 180° for gyro range mapping
+        int targetAngleSteps = (stepsPerRotation/180) * safeAngle;  // Use 180° to match gyro ±90° range
+        
+        // CRITICAL SAFETY LOGGING: Track all motor movements
+        // EFFICIENT PROCESSING: Minimal debug for maximum responsiveness
+        int currentMotorPosition = stepper->getCurrentPosition();
+        int movementDelta = targetAngleSteps - currentMotorPosition;
+        float movementDegrees = (float)movementDelta / (stepsPerRotation/180);
+        
+        //Serial.print("GYRO: "); //Serial.print(incoming.value, 1); 
+        //Serial.print("° → MOTOR: "); //Serial.print(safeAngle, 1);
+        //Serial.print("° ("); //Serial.print(targetAngleSteps); LogDebug(" steps)");
+        
+        // SAFETY: Detect dangerous movements (>360°)
+        if (abs(movementDegrees) > 360.0f) {
+            LogDebug("!!! DANGER: Movement >360° detected !!!");
+            //Serial.print("!!! BLOCKING: Would move "); //Serial.print(movementDegrees, 1); LogDebug("° !!!");
+            return; // ABORT dangerous movement
+        }
+        
+        // SAFETY: Only prevent truly dangerous movements, don't artificially limit range
+        // Allow full gyro range without clamping for smooth movement
+        
+        // REMOVED ABSOLUTE POSITION LIMIT: Allow full range of movement
+        // Previous ±180° limit was causing sudden stops during continuous operation
+        // Gyro input is already safely limited to ±90°, so cumulative position tracking is unnecessary
+        // User should have full control within the safe gyro input range
+        
+        // INCREASED BASE SPEED: Higher baseline for better responsiveness across all levels
+        // For FastAccelStepper: setSpeedInTicks uses microseconds per step (lower = faster)
+        // NEMA23 + TB6600 faster baseline: 6,667 steps/sec = 150µs/step
+        int baseSpeed = 150;  // Base: 150 µs/step = 6,667 steps/sec (faster baseline)
+        
+        // SIMPLIFIED 2-LEVEL RESPONSIVENESS: Speed stays unleashed, acceleration differs
+        float responsivenessMultiplier = 1.5f; // Keep speed high for both levels
+        bool slowAcceleration = false;
+        switch (responsivenessLevel) {
+            case 1: 
+                slowAcceleration = true;    // Slow - gentler acceleration/deceleration
+                break;
+            case 2:
+            case 3: 
+            case 4:
+            default: 
+                slowAcceleration = false;   // Normal - current fast acceleration
+                break;
+        }
+        
+        // EXTREME VELOCITY-PROPORTIONAL SPEED: Much more dramatic differences
+        float velocityMagnitude = abs(currentRotationVelocity);
+        float velocitySpeedMultiplier = 1.0f;
+        
+        // IMPROVED velocity mapping: Better base speeds for normal use
+        if (velocityMagnitude <= 1.0f) {
+            // Very slow rotation: 0.3x - 0.5x speed (still responsive for precision)
+            velocitySpeedMultiplier = 0.3f + (velocityMagnitude / 1.0f) * 0.2f; // 0.3x to 0.5x
+        } else if (velocityMagnitude <= 5.0f) {
+            // Slow rotation: 0.5x - 1.0x speed (good baseline range)
+            velocitySpeedMultiplier = 0.5f + ((velocityMagnitude - 1.0f) / 4.0f) * 0.5f; // 0.5x to 1.0x
+        } else if (velocityMagnitude <= 15.0f) {
+            // Medium rotation: 1.0x - 2.0x speed (noticeably faster)
+            velocitySpeedMultiplier = 1.0f + ((velocityMagnitude - 5.0f) / 10.0f) * 1.0f; // 1.0x to 2.0x
+        } else if (velocityMagnitude <= 30.0f) {
+            // Fast rotation: 2.0x - 4.0x speed (clearly fast)
+            velocitySpeedMultiplier = 2.0f + ((velocityMagnitude - 15.0f) / 15.0f) * 2.0f; // 2.0x to 4.0x
+        } else {
+            // Very fast rotation: 4.0x - 6.0x speed (EXTREME speed)
+            velocitySpeedMultiplier = 4.0f + min((velocityMagnitude - 30.0f) / 20.0f, 1.0f) * 2.0f; // 4.0x to 6.0x max
+        }
+        
+        // 2-LEVEL VELOCITY-BASED ACCELERATION: Different responses for Slow vs Normal
+        float velocityAccelAdjustment = 1.0f;
+        
+        if (slowAcceleration) {
+            // SLOW RESPONSIVENESS: Old conservative velocity-based acceleration
+            if (velocityMagnitude <= 2.0f) {
+                velocityAccelAdjustment = 1.5f; // Old conservative for slow precise movements
+            } else if (velocityMagnitude > 15.0f) {
+                velocityAccelAdjustment = 0.4f; // Old conservative reduction for fast movements
+            } else if (velocityMagnitude > 5.0f) {
+                velocityAccelAdjustment = 0.7f; // Old conservative for medium movements
+            }
+        } else {
+            // NORMAL RESPONSIVENESS: Current unleashed velocity-based acceleration
+            if (velocityMagnitude <= 2.0f) {
+                velocityAccelAdjustment = 1.8f; // Unleashed - higher acceleration for slow precise movements
+            } else if (velocityMagnitude > 15.0f) {
+                velocityAccelAdjustment = 0.7f; // Unleashed - less aggressive reduction for fast movements
+            } else if (velocityMagnitude > 5.0f) {
+                velocityAccelAdjustment = 1.0f; // Unleashed - better acceleration for medium movements
+            }
+        }
+        
+        float totalSpeedMultiplier = responsivenessMultiplier * velocitySpeedMultiplier;
+        
+        // Calculate final speed: Division correct for µs/step (lower = faster)
+        int finalSpeed = (int)(baseSpeed / totalSpeedMultiplier); // Divide because lower µs/step = faster
+        if (finalSpeed < 20) finalSpeed = 20; // UNLEASHED: 20 µs/step = 50,000 steps/sec (much higher limit!)
+        
+        // UNLEASHED: Convert µs/step to actual steps/sec for acceleration calculation
+        float actualSpeedStepsPerSec = 1000000.0f / finalSpeed; 
+        
+        // 2-LEVEL ACCELERATION SYSTEM: Different responsiveness through acceleration control
+        float baseAccelerationPercentage;
+        
+        if (slowAcceleration) {
+            // SLOW RESPONSIVENESS: Use old conservative acceleration (gentler feel)
+            if (actualSpeedStepsPerSec <= 4000) {
+                baseAccelerationPercentage = 0.85f; // Old working Slow setting
+            } else if (actualSpeedStepsPerSec <= 7000) {
+                baseAccelerationPercentage = 0.65f; // Old medium speeds
+            } else if (actualSpeedStepsPerSec <= 10000) {
+                baseAccelerationPercentage = 0.45f; // Old fast speeds  
+            } else {
+                baseAccelerationPercentage = 0.30f; // Old ultra-fast speeds
+            }
+        } else {
+            // NORMAL RESPONSIVENESS: Use current unleashed acceleration (aggressive feel)
+            if (actualSpeedStepsPerSec <= 4000) {
+                baseAccelerationPercentage = 1.2f; // Unleashed - more aggressive for slow speeds
+            } else if (actualSpeedStepsPerSec <= 10000) {
+                baseAccelerationPercentage = 0.9f; // Unleashed - better responsiveness for medium speeds
+            } else if (actualSpeedStepsPerSec <= 20000) {
+                baseAccelerationPercentage = 0.7f; // Unleashed - good balance for fast speeds  
+            } else {
+                baseAccelerationPercentage = 0.5f; // Unleashed - still responsive for ultra-fast speeds
+            }
+        }
+        
+        // Apply velocity-based acceleration adjustment
+        float finalAccelerationPercentage = baseAccelerationPercentage * velocityAccelAdjustment;
+        int finalAccel = (int)(actualSpeedStepsPerSec * finalAccelerationPercentage);
+        
+        // Safety limits
+        if (finalAccel < 50) finalAccel = 50;    // Minimum for basic responsiveness
+        if (finalAccel > 8000) finalAccel = 8000; // Lower maximum to prevent jitter
+        // CONTINUOUS VELOCITY DEBUG: Always show velocity info for calibration
+        static unsigned long lastDebugTime = 0;
+        if (millis() - lastDebugTime > 200) { // Debug 5 times per second for real-time feedback
+            String responseName = slowAcceleration ? "Slow" : "Normal";
+            String accelType = slowAcceleration ? "Conservative" : "Unleashed";
+            float actualSpeed = 1000000.0f / finalSpeed;
+            LogDebugFormatted("2-LEVEL: Gyro=%.2f°/s → Speed×%.2fx (%.0f sps) | Accel: %s [%s]\n", 
+                         velocityMagnitude, velocitySpeedMultiplier, actualSpeed, accelType.c_str(), responseName.c_str());
+            lastDebugTime = millis();
+        }
+        
+        // VERY CONSERVATIVE: Only change speed/acceleration when significantly different
+        // This prevents constant micro-adjustments that cause jitter at 200Hz
+        static int lastFinalSpeed = -1;
+        static int lastFinalAccel = -1;
+        
+        if (abs(finalSpeed - lastFinalSpeed) > 20) { // Increased from 5 to 20
+            stepper->setSpeedInTicks(finalSpeed);
+            lastFinalSpeed = finalSpeed;
+        }
+        
+        if (abs(finalAccel - lastFinalAccel) > 500) { // Decreased from 1000 to 500 but more stable
+            stepper->setAcceleration(finalAccel);
+            lastFinalAccel = finalAccel;
+        }
+        
+        // SIMPLE DIRECT MOVEMENT: Back to what was working better
+        // No filtering, no thresholds - just direct smooth updates
+        stepper->moveTo(targetAngleSteps);
+        
+        MotorStatus = ANGLE_MODE; // Set to angle positioning mode
       }
-      case FPAUSE: {
-        F_Pause = incomingcontrol.esp_value;
-        break;
+      break;
+      case FROTATION_SCALE:
+      {
+        // Set rotation scale factor (0.75x to 1.5x)
+        float newScale = incoming.value;
+        if (newScale >= 0.5f && newScale <= 2.0f) { // Allow reasonable range
+          rotationScale = newScale; // Now store as float value instead of integer index
+          LogDebug("Rotation Scale set to: ");
+          LogDebug(rotationScale);
+        }
       }
-      case FSENSATION: {
-        LogDebugPRIO("FSENSATION command received");
-        // SensationValue is a percentage of speedValue, scaled by sensationScale
-        float requestedPercent = incomingcontrol.esp_value; // 0-100 from remote
-        lastSensationPercent = requestedPercent;
-        SensationValue = (int)(speedValue * (requestedPercent / 100.0f) * sensationScale);
-        LogDebugPRIO(String("[FSENSATION] SensationValue=") + String(SensationValue) + " (" + String(requestedPercent) + "% of speedValue=" + String(speedValue) + ", scale=" + String(sensationScale) + ")");
-        break;
+      break;
+      case FRESPONSIVENESS:
+      {
+        // Set speed responsiveness: 1=Slow(0.7x), 2=Normal(1.0x), 3=Fast(1.5x), 4=Ultra(2.5x)
+        int newResponsiveness = (int)incoming.value;
+        if (newResponsiveness >= 1 && newResponsiveness <= 4) {
+          responsivenessLevel = newResponsiveness;
+          String responseName = (responsivenessLevel == 1) ? "Slow" : (responsivenessLevel == 2) ? "Normal" : (responsivenessLevel == 3) ? "Fast" : "Ultra";
+          LogDebug("Responsiveness set to: ");
+          LogDebug(responseName.c_str());
+        }
       }
-      case FANGLE: {
-        LogDebugPRIO("FANGLE command received");
-        // Multiply degrees by 2 for DIP settings, then map to steps
-        int targetAngleSteps = (int)((stepsPerRotation/360.0) * (-incomingcontrol.esp_value * rotationScale * 2));
-        EndPosition = targetAngleSteps;
-        MotorStatus = ANGLE_MODE;
-        // Do not move here; movement will be handled in loop() with velocity control
-        break;
+      break;
+      case FVELOCITY:
+      {
+        // Store rotation velocity for dynamic speed control
+        float incomingVelocity = incoming.value;
+        
+        // ANTI-DRIFT DEADZONE: Completely ignore very small velocities to prevent accumulating drift
+        const float VELOCITY_DEADZONE = 0.75f; // Ignore velocities below 0.75°/s
+        
+        if (abs(incomingVelocity) < VELOCITY_DEADZONE) {
+            currentRotationVelocity = 0.0f; // Force to zero to prevent drift
+            LogDebug("VELOCITY DEADZONE: Ignored ");
+            LogDebug(incomingVelocity);
+            LogDebug("°/s (below ");
+            LogDebug(VELOCITY_DEADZONE);
+            LogDebug("°/s threshold)");
+        } else {
+            currentRotationVelocity = incomingVelocity;
+            LogDebug("Velocity: ");
+            LogDebug(currentRotationVelocity);
+            LogDebug("°/s");
+        }
       }
-      case FROTATION_SCALE: {
-        rotationScale = incomingcontrol.esp_value;
-        break;
-      }
-      case FRESPONSIVENESS: {
-        responsivenessLevel = (int)incomingcontrol.esp_value;
-        break;
-      }
-      case FVELOCITY: {
-        LogDebugPRIO("FVELOCITY command received");
-        currentRotationVelocity = incomingcontrol.esp_value;
-        break;
-      }
-      case ON: {
+      break;
+      case ON:
+      {
+        LogDebug("MOTOR STARTED");
+        LogDebug("Speed Value: ");
+        LogDebug(speedValue);   
+        LogDebug("Sensation Value: ");
+        LogDebug(SensationValue); 
         MotorStatus=START;
-        break;
       }
-      case OFF: {
+      break;
+      case OFF:
+      {
         MotorStatus=STOP;
-        break;
       }
+      break;
       case CONNECT:
-      case HEARTBEAT: {
-        // ...existing code...
-        if (incomingcontrol.esp_sender == M5_ID) {
-          outgoingcontrol.esp_target = M5_ID;
-          outgoingcontrol.esp_sender = FIST_ID;
-          outgoingcontrol.esp_command = HEARTBEAT;
-          esp_err_t result = esp_now_send(M5_Remote_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
-          if (result == ESP_OK) {
+      case HEARTBEAT:
+      {
+        // Handle connection from M5 Remote
+        if (incoming.sender == M5_ID) {
+          outgoing.target = M5_ID;
+          outgoing.sender = FIST_ID;
+          outgoing.command = HEARTBEAT;
+          bool result = sendBleMessage(outgoing);
+          LogDebug(result ? 1 : 0);
+          
+          if (result) {
             M5_paired = true;
+            LogDebug("M5 remote Connected");
           }
         }
-        else if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID) {
-          outgoingcontrol.esp_target = FIST_IT_GYRO_ID;
-          outgoingcontrol.esp_sender = FIST_ID;
-          outgoingcontrol.esp_command = HEARTBEAT;
-          esp_err_t result = esp_now_send(mac, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
-          if (result == ESP_OK) {
+        // Handle connection from Fist-IT Remote Controller
+        else if (incoming.sender == FIST_IT_GYRO_ID) {
+          outgoing.target = FIST_IT_GYRO_ID;
+          outgoing.sender = FIST_ID;
+          outgoing.command = HEARTBEAT;
+
+          bool result = sendBleMessage(outgoing);
+          LogDebug("Responding to Fist-IT RC connection");
+          LogDebug(result ? 1 : 0);
+          
+          if (result) {
             FIST_IT_RC_paired = true;
+            LogDebug("Fist-IT Remote Controller Connected via CONNECT");
           }
         }
-        break;
       }
+      break;
     }
     
     // Send appropriate response directly to the sender (no peer switching needed for responses)
-    outgoingcontrol.esp_sender = FIST_ID;
-    outgoingcontrol.esp_command = CONNECT;
-    outgoingcontrol.esp_value = 1121212123123;
+    outgoing.sender = FIST_ID;
+    outgoing.command = CONNECT;
+    outgoing.value = 1121212123123;
     
-    if (incomingcontrol.esp_sender == M5_ID) {
-      outgoingcontrol.esp_target = M5_ID;
-    } else if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID) {
-      outgoingcontrol.esp_target = FIST_IT_GYRO_ID;
+    if (incoming.sender == M5_ID) {
+      outgoing.target = M5_ID;
+    } else if (incoming.sender == FIST_IT_GYRO_ID) {
+      outgoing.target = FIST_IT_GYRO_ID;
     }
     
-    // Send response directly to sender's MAC address
-    esp_err_t sendResult = esp_now_send(mac, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+    // Send response directly to connected BLE client
+    sendBleMessage(outgoing);
 
-  } // Close if(incomingcontrol.esp_target == FIST_ID)
+  } // Close if(incoming.target == FIST_ID)
 } // Close OnDataRecv function
 
 
-// Initialize ESP-NOW communication
-void setupESPNow() {
-    // WiFi setup is now done during splash screen, so skip setupWiFiManager()
-    
-    // Get the actual WiFi channel and use it for ESP-NOW
-    int32_t actualChannel;
-    if (WiFi.status() == WL_CONNECTED) {
-        actualChannel = WiFi.channel();
-        LogDebugFormattedPRIO("WiFi network '%s' is on channel: %d\n", WiFi.SSID().c_str(), actualChannel);
-    } else {
-        // If not connected to WiFi, use default channel 1
-        actualChannel = 1;
-        LogDebugPRIO("WiFi not connected, using default channel 1 for ESP-NOW");
-    }
-    
-    actualChannel = 1; // Force channel 1 for compatibility with Fist-IT Motor
+void setupBLEComm() {
+  NimBLEDevice::init(FIST_BLE_DEVICE_NAME);
+  g_bleServer = NimBLEDevice::createServer();
+  g_bleServer->setCallbacks(new FistBleServerCallbacks());
 
-    // Set ESP-NOW to use the determined channel
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(actualChannel, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(false);
-    
-    LogDebugFormattedPRIO("ESP-NOW channel set to: %d (matches WiFi)\n", actualChannel);
-    
-    // Print our own MAC address for reference
-    //Serial.print("Fist-IT Gyro Controller MAC: ");
-    LogDebugPRIO(WiFi.macAddress());
-    
-    // Initialize ESP-NOW
-    //Serial.print("Initializing ESP-NOW... ");
-    if (esp_now_init() != ESP_OK) {
-        LogDebug("Error initializing ESP-NOW");
-        return;
-    }
-    LogDebug("Success!");
-    
-    // Register callback functions
-      esp_now_register_send_cb(OnDataSent);
-  
-      // Initialize single dynamic peer info structure
-      memset(&peerInfo, 0, sizeof(peerInfo));
-      peerInfo.channel = 1;  
-      peerInfo.encrypt = false;
-    
-      // Register for a callback function that will be called when data is received
-      esp_now_register_recv_cb(OnDataRecv);
-    
-    // Set up broadcast peer for initial discovery
-    memset(&peerInfo, 0, sizeof(peerInfo));
-    uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-    peerInfo.channel = 1;  
-    peerInfo.encrypt = false;
-    
-    // Add broadcast peer
-    esp_err_t peerResult = esp_now_add_peer(&peerInfo);
-    if (peerResult != ESP_OK) {
-        LogDebugFormatted("Failed to add broadcast peer, error: %d\n", peerResult);
-        return;
-    }
-    
-    LogDebugPRIO("ESP-NOW initialized with broadcast peer");
-    LogDebug("Sending discovery messages to find devices...");
-    
+  NimBLEService *service = g_bleServer->createService(FIST_BLE_SERVICE_UUID);
+  g_bleRxChar = service->createCharacteristic(
+      FIST_BLE_RX_UUID,
+      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  g_bleTxChar = service->createCharacteristic(
+      FIST_BLE_TX_UUID,
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+
+  g_bleRxChar->setCallbacks(new FistBleRxCallbacks());
+
+  NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+  advertising->addServiceUUID(FIST_BLE_SERVICE_UUID);
+  advertising->enableScanResponse(true);
+  advertising->start();
+
+  LogDebugPRIO("BLE advertising started for Fist-IT");
 }
+
 
 void setup(void) {
   Serial.begin(115200);
+  delay(1000);
 
-  WiFi.mode(WIFI_AP_STA);
-  LogDebug(WiFi.channel());
-  WiFi.printDiag(Serial);
-  MDNS.begin("fist-it");
+#if defined(ESP32)
+  // Silence verbose NimBLE debug lines like "D NimBLECharacteristic" in serial monitor.
+  esp_log_level_set("NimBLECharacteristic", ESP_LOG_WARN);
+  esp_log_level_set("NimBLEServer", ESP_LOG_WARN);
+  esp_log_level_set("NimBLEClient", ESP_LOG_WARN);
+  esp_log_level_set("NimBLEScan", ESP_LOG_WARN);
+#endif
 
-
-  // WiFiManager setup for automatic network configuration
-  // WiFiManager wifiManager;
-  // WiFi.setHostname("fist-it");
-  // wifiManager.setConfigPortalTimeout(300);
-  // wifiManager.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
-
-  // LogDebug("=== Fist-IT Motor WiFi Configuration ===");
-  // LogDebug("If WiFi connection fails, connect to hotspot:");
-  // LogDebug("Network: FistIT-Motor-Config");
-  // LogDebug("URL: http://192.168.4.1");
-  // LogDebug("OR: http://fist-it/wifi (once connected to WiFi)");
-  // LogDebug("=======================================");
-
-  // Try to connect to saved WiFi, or start config portal
-  // if (!wifiManager.autoConnect("FistIT-Motor-Config")) {
-  //   LogDebug("Failed to connect WiFi, restarting...");
-  //   ESP.restart();
-  // }
-    int32_t actualChannel = WiFi.channel();
-    LogDebug("Connected to WiFi on channel: ");
-    LogDebug(actualChannel);
-    LogDebug(WiFi.channel());   
-    WiFi.printDiag(Serial);
-
-    LogDebug("Starting Fist-IT Gyro Controller Setup"); 
-
-    actualChannel = 1; // Force channel 1 for compatibility with Fist-IT Motor
-
-    // Set ESP-NOW to use channel 1
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(actualChannel, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(false);
-    LogDebug(WiFi.channel());
-    WiFi.printDiag(Serial);
-    // Now set up ESP-NOW
-    setupESPNow();
+  // Initialize BLE transport for M5 Remote communication.
+  setupBLEComm();
 
   
   pinMode(enablePinStepper, OUTPUT);
@@ -767,227 +873,109 @@ void setup(void) {
     stepper->setEnablePin(enablePinStepper);
     stepper->setAutoEnable(true);
     stepper->setDelayToDisable(5000);
-    int MaxSpeedTicks = stepper->getMaxSpeedInTicks();
-    LogDebug("Max Speed in Ticks (FastAccelStepper): ");
-    LogDebug(MaxSpeedTicks);
-    // Set current position to zero at startup
-    stepper->setCurrentPosition(0);
-    LogDebugPRIO("Stepper current position set to 0 at startup");
+    int MaxSpeed1 = stepper->getMaxSpeedInHz();
+    LogDebug("Max Speed in HZ: "); 
+    LogDebug(MaxSpeed1); 
+    int MaxSpeed2 = stepper->getMaxSpeedInMilliHz();
+    LogDebug("Max Speed in MiliHZ: "); 
+    LogDebug(MaxSpeed2); 
+    int MaxSpeed3 = stepper->getMaxSpeedInTicks();
+    LogDebug("Max Speed in Ticks: "); 
+    LogDebug(MaxSpeed3); 
+    int MaxSpeed4 = stepper->getMaxSpeedInUs();
+    LogDebug("Max Speed in US: "); 
+    LogDebug(MaxSpeed4); 
+    int MaxSpeed=10000;
+
   }
 
     //test to show board works 
-    stepper->setSpeedInHz(50000);
-    stepper->setAcceleration(50000);
+    stepper->setSpeedInTicks(5000);
+    stepper->setAcceleration(20000);
+    stepper->setCurrentPosition(500);
     stepper->moveTo(0);
-
-  
-  
-      //Send first heartbeat to M5 remote
-  
-      if(!M5_paired){
-        LogDebug("Sending first heartbeat");
-        LogDebugFormatted("to M5 remote addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", M5_Remote_Address[0], M5_Remote_Address[1], M5_Remote_Address[2], M5_Remote_Address[3], M5_Remote_Address[4], M5_Remote_Address[5]);
-  
-        outgoingcontrol.esp_command = HEARTBEAT;
-        outgoingcontrol.esp_heartbeat = true;
-        outgoingcontrol.esp_target = M5_ID;
-        outgoingcontrol.esp_sender = FIST_ID;
-        esp_err_t result = esp_now_send(M5_Remote_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
-        if (result == !ESP_OK) {
-          LogDebug("Sending to M5 failed (not paired)");
-        }
-  
-      }
-
-      xTaskCreatePinnedToCore(espNowRemoteTask,      /* Task function. */
-                            "espNowRemoteTask",  /* name of task. */
-                            3096,               /* Stack size of task */
-                            NULL,               /* parameter of the task */
-                            5,                  /* priority of the task */
-                            &eRemote_t,         /* Task handle to keep track of created task */
-                            0);                 /* pin task to core 0 */
   delay(200);
 }
 
-void espNowRemoteTask(void *pvParameters)
-{
-  for(;;){
-      //CheckAllPeers;
-      if(M5_paired){
-      LogDebug("Heartbeat M5");
-//      LogDebugFormatted("OSSM addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", OSSM_Address[0], OSSM_Address[1], OSSM_Address[2], OSSM_Address[3], OSSM_Address[4], OSSM_Address[5]);
-      outgoingcontrol.esp_command = HEARTBEAT;
-      outgoingcontrol.esp_sender = FIST_ID;
-      outgoingcontrol.esp_heartbeat = true;
-      outgoingcontrol.esp_target = M5_ID;
-      esp_err_t result = esp_now_send(M5_Remote_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
-      if (result == ESP_OK) {
-//        LogDebug("Sent ok");
-      } 
-      else {
-        LogDebug("failed to send heartbeat");
-      }
-    }
-    
-    // Send heartbeat to Fist-IT RC if paired
-    if(FIST_IT_RC_paired){
-      LogDebug("Heartbeat Fist-IT RC");
-      // Re-add direct peer for Fist-IT Gyro before sending
-      esp_now_del_peer(FIST_IT_RC_Address); // Remove if already exists
-      memset(&peerInfo, 0, sizeof(peerInfo));
-      memcpy(peerInfo.peer_addr, FIST_IT_RC_Address, 6);
-      peerInfo.channel = 1;
-      peerInfo.encrypt = false;
-      esp_now_add_peer(&peerInfo);
-      outgoingcontrol.esp_command = HEARTBEAT;
-      outgoingcontrol.esp_sender = FIST_ID;
-      outgoingcontrol.esp_heartbeat = true;
-      outgoingcontrol.esp_target = FIST_IT_GYRO_ID;
-      esp_err_t result = esp_now_send(FIST_IT_RC_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
-      if (result == ESP_OK) {
-        LogDebug("Fist-IT RC Heartbeat sent ok");
-      } 
-      else {
-        LogDebugFormatted("failed to send Fist-IT Gyro heartbeat with MAC Address: %02X:%02X:%02X:%02X:%02X:%02X\n", FIST_IT_RC_Address[0], FIST_IT_RC_Address[1], FIST_IT_RC_Address[2], FIST_IT_RC_Address[3], FIST_IT_RC_Address[4], FIST_IT_RC_Address[5]);
-      }
-    }
-    
-    delay(200);
-    LogDebug("Heartbeat ALL");
-    LogDebugFormatted("on wifi channel : %d\n", WiFi.channel());
-    outgoingcontrol.esp_command = HEARTBEAT;
-    outgoingcontrol.esp_sender = FIST_ID;
-    outgoingcontrol.esp_heartbeat = true;
-    outgoingcontrol.esp_target = FIST_IT_GYRO_ID;  // Target FIST_IT_GYRO_ID for discovery pairing
-    esp_err_t result = esp_now_send(DEFAULT_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
-    //StatusMessageOut();
-
-    //problem when adding if Fist-IT not paired
-    vTaskDelay(HEARTBEAT_INTERVAL);
+void pollBLEComm() {
+  if (g_bleMessagePending) {
+    g_bleMessagePending = false;
+    OnDataRecv();
   }
+
+  if (!g_bleClientConnected) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - g_lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) {
+    return;
+  }
+  g_lastHeartbeatMs = now;
+
+  outgoing.command = HEARTBEAT;
+  outgoing.sender = FIST_ID;
+  outgoing.heartbeat = true;
+  outgoing.target = M5_ID;
+  sendBleMessage(outgoing);
 }
 
 void loop(void) {
 
-  if (MotorStatus == START) {
-    // M5 remote: use speedValue and SensationValue for speed/accel
-    LogDebugPRIO(String("[M5 DEBUG] MotorStatus=START, speedValue=") + String(speedValue) + ", SensationValue=" + String(SensationValue));
-    int speedHz = speedValue;
-    int accel = SensationValue;
-    if (speedHz < minSpeedHz) speedHz = minSpeedHz;
-    if (speedHz > maxSpeedHz) speedHz = maxSpeedHz;
-    if (accel < 500) accel = 500;
-    if (accel > 40000) accel = 40000;
-//    LogDebugPRIO(String("[M5 DEBUG] Calculated speedHz: ") + String(speedHz) + ", accel: " + String(accel));
-//    LogDebugPRIO(String("[M5 DEBUG] CurrentPosition: ") + String(stepper->getCurrentPosition()));
-    stepper->setSpeedInHz(speedHz);
-    stepper->setAcceleration(accel);
-    // Oscillate between EndPosition and StartPosition
-    if (stepper->targetPos() == stepper->getCurrentPosition()) {
-      if (stepper->getCurrentPosition() == StartPosition) {
-        stepper->moveTo(EndPosition);
-        LogDebugPRIO("[M5 DEBUG] Moving to EndPosition: " + String(EndPosition));
-      } else if (stepper->getCurrentPosition() == EndPosition) {
-        stepper->moveTo(StartPosition);
-        LogDebugPRIO("[M5 DEBUG] Moving to StartPosition: " + String(StartPosition));
-      } else if (stepper->getCurrentPosition() < EndPosition) {
-        stepper->moveTo(EndPosition);
-        LogDebugPRIO("[M5 DEBUG] Moving to EndPosition: " + String(EndPosition));
-      } else {
-        stepper->moveTo(StartPosition);
-        LogDebugPRIO("[M5 DEBUG] Moving to StartPosition: " + String(StartPosition));
-      }
-    }
-  }
-
-
-  else if (MotorStatus==ANGLE_MODE){
-    // In angle mode, move to EndPosition using velocity control
-    float velocity = currentRotationVelocity;
-    int minSpeedHz = 20;
-    int maxSpeedHz = 50000;
-    // Responsiveness/acceleration mapping
-    int baseAcceleration;
-    if (responsivenessLevel == 1) {
-      baseAcceleration = 6000; // Gentle
-    } else {
-      baseAcceleration = 20000; // Fast
-    }
-    int finalAccel = (int)(baseAcceleration * 0.95f);
-    if (finalAccel < 2000) finalAccel = 2000;
-    if (finalAccel > 40000) finalAccel = 40000;
-
-    int speedHz;
-    int currentPos = stepper->getCurrentPosition();
-    float velocityMagnitude = abs(velocity);
-    if (velocityMagnitude < 0.01f) {
-      stepper->forceStop();
-    } else {
-      // Map 0-100 (velocityMagnitude) to 0-50000 Hz
-      speedHz = (int)((velocityMagnitude / 100.0f) * maxSpeedHz);
-      if (speedHz < minSpeedHz) speedHz = minSpeedHz;
-      if (speedHz > maxSpeedHz) speedHz = maxSpeedHz;
-//      LogDebugPRIO(String("[ANGLE_MODE] Calculated speedHz: ") + String(speedHz));
-//      LogDebugPRIO(String("[ANGLE_MODE] moveTo called: EndPosition=") + String(EndPosition) + ", CurrentPosition=" + String(stepper->getCurrentPosition()) + ", StepsToMove=" + String(EndPosition - stepper->getCurrentPosition()));
-      delay(200); // Small delay to ensure smooth transition
-      stepper->setSpeedInHz(speedHz);
-      stepper->setAcceleration(finalAccel);
-      stepper->moveTo(EndPosition);
-      LogDebugPRIO("[DEBUG] stepper->moveTo(" + String(EndPosition) + ") called");
-    }
-    // Movement will continue until EndPosition is reached
-  }
-
-else if (MotorStatus==STOP){
-  stepper->forceStop();
-  LogDebug("MOTOR STOPPED");
-  MotorStatus=IDLE;
-  }
-
- /////////////////////////////////OTA code/////////////////////////////////////
-
-//  server.handleClient();
-//  ElegantOTA.loop();
-
-
-}
-
-
-void loopOLD(void) {
+  pollBLEComm();
 
 
   if (MotorStatus==START){
-    if (activeController == FIST_IT_GYRO_ID) {
-      int gyroSpeed = speedValue;
-      if (gyroSpeed < 20) gyroSpeed = 20;
-      if (gyroSpeed > 10000) gyroSpeed = 10000;
-      int gyroAccel = gyroSpeed / 2;
-      if (gyroAccel < 1000) gyroAccel = 1000;
-      stepper->setSpeedInHz(gyroSpeed);
-      stepper->setAcceleration(gyroAccel);
-      LogDebugPRIO(String("Gyro command: speed=") + String(gyroSpeed) + String(", accel=") + String(gyroAccel));
-    } else {
-      LogDebugFormatted("Motor STARTED with speed value: %d", speedValue);
-      int safeSpeed = speedValue;
-      if (safeSpeed < 20) safeSpeed = 20;
-      if (safeSpeed > 10000) safeSpeed = 10000;
-      int safeAccel = safeSpeed / 2;
-      if (safeAccel < 1000) safeAccel = 1000;
-      stepper->setSpeedInHz(safeSpeed);
-      stepper->setAcceleration(safeAccel);
-    }
-    if (stepper->targetPos()==stepper->getCurrentPosition()) {
-      if (stepper->getCurrentPosition()==StartPosition) {
-        stepper->moveTo(EndPosition);
-      }else if (stepper->getCurrentPosition()==EndPosition) {
+//    stepper->setSpeedInTicks(900);
+//    stepper->setAcceleration(700);
+
+int commandedSpeed = speedValue;
+int commandedAccel = SensationValue;
+
+int finalSpeedSps = mapStrokeSpeedSpsFromSetting(commandedSpeed);
+// FastAccelStepper uses microseconds per step, so lower values mean faster motion.
+int finalSpeedTickUs = convertStrokeSpeedSpsToTickUs(finalSpeedSps);
+int strokeDistanceSteps = abs(EndPosition - StartPosition);
+int finalAccel = calculateStrokeAccelFromSpeed(commandedAccel, finalSpeedSps);
+
+stepper->setSpeedInTicks(finalSpeedTickUs);
+stepper->setAcceleration(finalAccel);
+LogDebugFormatted("Motor Speed: %d sps (tick_us=%d), Accel: %d steps/s^2, SpeedSetting: %d, AccelSetting: %d, StrokeSteps: %d\n",
+                  finalSpeedSps,
+                  finalSpeedTickUs,
+                  finalAccel,
+                  strokeSpeedSetting,
+                  strokeAccelSetting,
+                  strokeDistanceSteps);
+if (stepper->targetPos()==stepper->getCurrentPosition()) {
+  //delay((F_Pause*100)+1); //pause in ms
+  if (stepper->getCurrentPosition()==StartPosition) {
+      stepper->moveTo(EndPosition);
+      }else      
+      if (stepper->getCurrentPosition()==EndPosition) {
         stepper->moveTo(StartPosition);
-      }else if (stepper->getCurrentPosition()<EndPosition) {
+      }else      
+      if (stepper->getCurrentPosition()<EndPosition) {
         stepper->moveTo(EndPosition);
-      }else {
+      }else      
         stepper->moveTo(EndPosition);
-      }
     }
-  }
+  }  
+/*    
+    if (stepper->targetPos()==stepper->getCurrentPosition()) {
+    if (stepper->getCurrentPosition()==0) {
+      stepper->moveTo(1000);
+      }else      
+      if (stepper->getCurrentPosition()==1000) {
+        stepper->moveTo(0);
+      }else      
+      if (stepper->getCurrentPosition()<1000) {
+        stepper->moveTo(1000);
+      }else      
+        stepper->moveTo(1000);
+
+    } 
+  }*/
 
   else if (MotorStatus==ANGLE_MODE){
     // In angle mode, just hold the current position
@@ -1007,6 +995,6 @@ else if (MotorStatus==STOP){
 //  ElegantOTA.loop();
 
 
-}
+}//end of loop
 
 
