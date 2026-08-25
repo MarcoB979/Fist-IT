@@ -1,0 +1,1846 @@
+//THISIS CONFIRMED A WORKING VERSION!! DO NOT DELETE
+#include "FastAccelStepper.h"
+#include <Arduino.h>          // Basic Needs
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <ESPmDNS.h>
+#include <WiFiManager.h> // WiFiManager library for automatic WiFi configuration
+#include <WebSocketsServer.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
+
+// User-configurable: set to 1 to invert direction, 0 for normal
+#define DirectionInvert 1
+
+/////////////////////////////////OTA Part/////////////////////////////////////
+
+#if defined(ESP8266)
+  #include <ESP8266WiFi.h>
+  #include <WiFiClient.h>
+  #include <ESP8266WebServer.h>
+#elif defined(ESP32)
+  #include <WiFi.h>
+  #include <WiFiClient.h>
+  #include <WebServer.h>
+#elif defined(TARGET_RP2040) || defined(TARGET_RP2350) || defined(PICO_RP2040) || defined(PICO_RP2350)
+  #include <WiFi.h>
+  #include <WiFiClient.h>
+  #include <WiFiServer.h>
+  #include <WebServer.h>
+#endif
+
+#include <ElegantOTA.h>
+
+// WiFiManager will handle SSID and password configuration automatically
+// No need for hardcoded credentials
+
+#if defined(ESP8266)
+  ESP8266WebServer server(80);
+#elif defined(ESP32)
+  WebServer server(80);
+#elif defined(TARGET_RP2040) || defined(TARGET_RP2350) || defined(PICO_RP2040) || defined(PICO_RP2350)
+  WebServer server(80);
+#endif
+
+unsigned long ota_progress_millis = 0;
+
+int lastspeed = 0;
+
+int32_t getWiFiChannel(const char *ssid) {
+  if (int32_t n = WiFi.scanNetworks()) {
+      for (uint8_t i=0; i<n; i++) {
+          if (!strcmp(ssid, WiFi.SSID(i).c_str())) {
+              return WiFi.channel(i);
+          }
+      }
+  }
+  return 0;
+}
+
+/////////////////////////////////FIST-IT part/////////////////////////////////////
+
+
+//#define C3devboard
+//#define C3mini
+#define C3miniV2
+
+#ifdef C3mini
+    #define dirPinStepper 1
+    #define enablePinStepper 0
+    #define stepPinStepper 2
+    #define LVpin 99
+
+#endif
+
+#ifdef C3miniV2
+    #define dirPinStepper 1
+    #define enablePinStepper 10
+    #define stepPinStepper 0
+    #define LVpin 99
+
+#endif
+
+
+#ifdef C3devboard
+    #define dirPinStepper 16 //3
+    #define enablePinStepper 4 //1
+    #define stepPinStepper 17 //2
+    #define LVpin 23 //2
+#endif
+
+
+
+FastAccelStepperEngine engine = FastAccelStepperEngine();
+FastAccelStepper *stepper = NULL;
+int pos=0;
+int EndPosition=0;
+int StartPosition=0;
+int speedValue =1;
+int stepsPerRotation = 1800;  //was 1800
+int SensationValue = 100;
+float lastSensationPercent = 100.0f; // Default to 100% if not set by FSENSATION
+float sensationScale = 1.5f; // Default: 1.0 (100% of requested percentage)
+int F_Pause = 0;
+int START=1;
+int STOP=0;
+int IDLE=444;
+int ANGLE_MODE=555;
+int MotorStatus=IDLE;
+String Direction="";
+static int lastTarget = 0;
+  
+int minSpeedHz = 20;   // Minimum speed in Hz
+int maxSpeedHz = 50000;  // Maximum speed in Hz
+int baseAcceleration = 15000;
+
+// XToys WebSocket custom toy settings
+#define XTOYS_WEBSOCKET_PORT 8080
+#define XTOYS_MAX_MSG_PER_SEC 10
+// Empirical calibration for XToys angle commands to match physical output degrees.
+#define XTOYS_ANGLE_SCALE 2.0f
+// Optional cloud mode: set webhook id to enable direct XToys cloud connection.
+#define XTOYS_WEBHOOK_ID "GJkIj33RHCyj"
+#define XTOYS_WEBHOOK_AUTH_TOKEN "e5f12518ac83d8a68a732eff6b0f4615"
+
+WebSocketsServer xtoysWebSocket = WebSocketsServer(XTOYS_WEBSOCKET_PORT);
+WebSocketsClient xtoysCloudWebSocket;
+String xtoysIdentifier = "FIST-IT";
+unsigned long xtoysLastMessageMs = 0;
+unsigned long xtoysLastStatusBroadcastMs = 0;
+bool xtoysCloudConnected = false;
+bool xtoysCloudHasPayload = false;
+String xtoysCloudPath = "";
+String xtoysCloudHeaders = "";
+bool espNowEnabled = true;
+bool xtoysCloudInitialized = false;
+unsigned long xtoysLastCloudRxMs = 0;
+unsigned long espNowLastRxMs = 0;
+unsigned long lastCloudRetryMs = 0;
+const unsigned long CLOUD_RETRY_INTERVAL_MS = 10000;
+const unsigned long ESPNOW_IDLE_FAILBACK_MS = 30000;
+const unsigned long CLOUD_RX_INACTIVITY_FALLBACK_MS = 20000;
+const unsigned long CLOUD_PROBE_WAIT_MS = 3500;
+const unsigned long ESPNOW_PAIRING_TIMEOUT_MS = 20000;
+const bool ESPNOW_ONLY_MODE = true;  // Set true to disable WiFi/XToys entirely
+bool espNowModeLockedByM5 = false;
+unsigned long espNowPairingStartMs = 0;
+bool xtoysLocalServerStarted = false;
+enum ControlMode {
+  MODE_AUTO = 0,
+  MODE_CLOUD = 1,
+  MODE_ESPNOW = 2
+};
+ControlMode activeControlMode = MODE_AUTO;
+int xtoysForceLevel = 5; // 0..5, where 5 means immediate full speed
+bool xtoysRampActive = false;
+int xtoysRampStartPosition = 0;
+int xtoysRampTargetPosition = 0;
+long xtoysRampTotalSteps = 0;
+
+#define FSPEED  30
+#define FROTATION   31
+#define FPAUSE   32
+#define FSENSATION  33
+#define FANGLE  34
+#define FROTATION_SCALE  35   // Set rotation amplification (1-4x)
+#define FRESPONSIVENESS  36   // Set speed responsiveness: 1=Normal(0.7x), 2=Fast(2.5x), 3=Ultra(5x)
+#define FVELOCITY  37   // Rotation velocity for dynamic speed control
+#define FSTOP  38   // Safety stop command (1=STOP/SAFE, 0=GO/ACTIVE)
+
+// OSSM STROKE ENGINE COMMANDS (from M5 Remote)
+#define SPEED 1
+#define DEPTH 2
+#define STROKE 3
+#define SENSATION 4
+#define PATTERN 5
+#define HEARTBEAT 99
+#define CONNECT 88
+
+#define OSSM_ID  1 //OSSM_ID Default can be changed with M5 Remote in the Future will be Saved in EPROOM
+#define FIST_ID 3 //M5_ID Default can be changed with M5 Remote in the Future will be Saved in EPROOM
+#define FIST_IT_GYRO_ID 4 //Fist-IT Gyro Controller ID
+#define M5_ID 99 //M5_ID Default can be changed with M5 Remote in the Future will be Saved in EPROOM
+
+uint8_t DEFAULT_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Broadcast to all ESP32s, upon connection gets updated to the actual address
+uint8_t M5_Remote_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+//uint8_t M5_Remote_Address[] = {0xB0, 0xB2, 0x1C, 0x50, 0xF6, 0xDC};
+
+// OSSM STROKE ENGINE CONNECTION
+uint8_t OSSM_Address[] = {0xC0, 0x5D, 0x89, 0xB3, 0xDA, 0xFC}; // OSSM MAC address from M5 Remote code
+uint8_t FIST_IT_RC_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Fist-IT Remote Controller address
+
+#define OFF 10
+#define ON  11
+
+#define CONNECT 88
+#define HEARTBEAT 99
+
+///////////////////////////////////////////
+////
+////  To Debug or not to Debug
+////
+///////////////////////////////////////////
+
+// Uncomment the following line if you wish to print DEBUG info
+
+//#define DEBUG 
+
+#ifdef DEBUG
+#define LogDebug(...) Serial.println(__VA_ARGS__)
+#define LogDebugFormatted(...) Serial.printf(__VA_ARGS__)
+#else
+#define LogDebug(...) ((void)0)
+#define LogDebugFormatted(...) ((void)0)
+#endif
+
+// Uncomment the following line if you wish to print DEBUG info
+#define DEBUGPRIO 
+
+#ifdef DEBUGPRIO
+#define LogDebugPRIO(...) Serial.println(__VA_ARGS__)
+#define LogDebugFormattedPRIO(...) Serial.printf(__VA_ARGS__)
+#else
+#define LogDebugPRIO(...) ((void)0)
+#define LogDebugFormattedPRIO(...) ((void)0)
+#endif
+
+
+
+// Variable to store if sending data was successful
+String success = "";
+
+float out_esp_speed;
+float out_esp_depth;
+float out_esp_stroke;
+float out_esp_sensation;
+float out_esp_pattern;
+bool out_esp_rstate;
+bool out_esp_connected;
+int out_esp_command;
+float out_esp_value;
+int out_esp_target;
+int out_esp_sender;
+
+float incoming_esp_speed;
+float incoming_esp_depth;
+float incoming_esp_stroke;
+float incoming_esp_sensation;
+float incoming_esp_pattern;
+bool incoming_esp_rstate;
+bool incoming_esp_connected;
+bool incoming_esp_heartbeat;
+int incoming_esp_target;
+int incoming_esp_sender;
+
+typedef struct struct_message {
+  float esp_speed;
+  float esp_depth;
+  float esp_stroke;
+  float esp_sensation;
+  float esp_pattern;
+  bool esp_rstate;
+  bool esp_connected;
+  bool esp_heartbeat;
+  int esp_command;
+  float esp_value;
+  int esp_target;
+  int esp_sender;
+} struct_message;
+
+bool M5_paired = false;
+bool FIST_IT_RC_paired = false;
+bool OSSM_paired = false;  // OSSM stroke engine pairing status
+
+// User-configurable settings
+float rotationScale = 1.0f;        // Scale factor: 0.75x to 1.5x (default 1x)
+float m5RotationTurnScale = 2.0f;  // 360 from M5 maps to one full mechanical turn
+int responsivenessLevel = 4;     // 1x to 4x speed (default 4x)
+float currentRotationVelocity = 0.0f; // Current rotation velocity in degrees/second
+
+// SAFETY SYSTEM VARIABLES
+bool gyroSafetyEngaged = true;   // Gyro safety status (true = safe/motor disabled)
+int activeController = 0;       // Track which controller is currently active (0=none, M5_ID, FIST_IT_GYRO_ID)
+unsigned long lastM5CommandTime = 0;
+unsigned long lastGyroCommandTime = 0;
+const unsigned long DEVICE_TIMEOUT = 2000; // 2 seconds timeout for device priority
+
+struct_message outgoingcontrol;
+struct_message incomingcontrol;
+
+esp_now_peer_info_t peerInfo;  // Single dynamic peer info
+#define HEARTBEAT_INTERVAL 15000/portTICK_PERIOD_MS	// 5 seconds
+TaskHandle_t eRemote_t  = nullptr;  // Esp Now Remote Task
+void espNowRemoteTask(void *pvParameters);
+
+void setupXToysWebSocket();
+void xtoysWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length);
+void setupXToysCloudWebSocket();
+void xtoysCloudWebSocketEvent(WStype_t type, uint8_t *payload, size_t length);
+bool connectWiFiForInternet();
+bool reconnectSavedWiFiForCloud();
+void startXToysAccessPoint(int channel);
+void enableEspNowMode();
+void disableEspNowMode();
+void waitForInitialCloudConnection();
+void handleAutoModeTransitions();
+void processXToysJsonCommand(const String &jsonPayload);
+void applyXToysCommand(const String &key, const String &value);
+void broadcastXToysStatus();
+
+
+
+/////////////////////////////////OTA Callbacks/////////////////////////////////////
+
+void onOTAStart() {
+  // Log when OTA has started
+  LogDebugPRIO("OTA update started!");
+  // <Add your own code here>
+}
+
+void onOTAProgress(size_t current, size_t final) {
+  // Log every 1 second
+  if (millis() - ota_progress_millis > 1000) {
+    ota_progress_millis = millis();
+    LogDebugFormattedPRIO("OTA Progress Current: %u bytes, Final: %u bytes\n", current, final);
+  }
+}
+
+void onOTAEnd(bool success) {
+  // Log when OTA has finished
+  if (success) {
+    LogDebugPRIO("OTA update finished successfully!");
+  } else {
+    LogDebugPRIO("There was an error during OTA update!");
+  }
+  // <Add your own code here>
+}
+
+/////////////////////////////////OTA Callbacks/////////////////////////////////////
+
+// OSSM STROKE ENGINE COMMUNICATION
+bool SendOSSMCommand(int command, float value) {
+  if (!OSSM_paired) {
+    LogDebug("OSSM not paired - attempting to connect");
+    
+    // Try to pair with OSSM by sending heartbeat
+    struct_message ossmMessage;
+    memset(&ossmMessage, 0, sizeof(ossmMessage));
+    ossmMessage.esp_command = HEARTBEAT;
+    ossmMessage.esp_heartbeat = true;
+    ossmMessage.esp_target = OSSM_ID;
+    ossmMessage.esp_sender = FIST_ID;
+    
+    esp_err_t result = esp_now_send(OSSM_Address, (uint8_t *) &ossmMessage, sizeof(ossmMessage));
+    if (result == ESP_OK) {
+      LogDebug("OSSM heartbeat sent for pairing");
+    }
+    return false;
+  }
+  
+  // Send command to paired OSSM
+  struct_message ossmMessage;
+  memset(&ossmMessage, 0, sizeof(ossmMessage));
+  ossmMessage.esp_connected = true;
+  ossmMessage.esp_command = command;
+  ossmMessage.esp_value = value;
+  ossmMessage.esp_target = OSSM_ID;
+  ossmMessage.esp_sender = FIST_ID;
+  
+  esp_err_t result = esp_now_send(OSSM_Address, (uint8_t *) &ossmMessage, sizeof(ossmMessage));
+  if (result == ESP_OK) {
+    LogDebugFormatted("OSSM command sent: CMD=%d, VALUE=%.2f, MAC ADDRESS: %02X:%02X:%02X:%02X:%02X:%02X\n", command, value, OSSM_Address[0], OSSM_Address[1], OSSM_Address[2], OSSM_Address[3], OSSM_Address[4], OSSM_Address[5] );
+    return true;
+  } else {
+    LogDebugFormatted("Failed to send OSSM command: CMD=%d\n", command);
+    return false;
+  }
+}
+
+
+// Callback when data is sent
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+/*
+  LogDebugFormatted("\r\nLast Packet Send Status:\t");
+  LogDebugFormatted(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+  LogDebugFormatted("Targert MAC addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+  LogDebugFormatted("outgoing target ID : %d\n", outgoingcontrol.esp_target);
+  LogDebugFormatted("outgoing sender ID : %d\n", outgoingcontrol.esp_sender);
+  LogDebugFormatted("outgoing command : %d\n", outgoingcontrol.esp_command);
+*/
+
+  if (status ==0){
+    success = "Delivery Success :)";
+  }
+  else{
+    success = "Delivery Fail :(";
+  }
+}
+
+void OnDataRecvGYRO(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  espNowLastRxMs = millis();
+  activeControlMode = MODE_ESPNOW;
+  bool needToAddPeer = false;
+//  LogDebugPRIO("Time received: " + String(millis()));
+
+  memcpy(&incomingcontrol, incomingData, sizeof(incomingcontrol));
+  if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID && !FIST_IT_RC_paired) {
+    // Fist-IT RC trying to connect for first time
+    esp_now_del_peer(peerInfo.peer_addr); // Clear any existing peer
+    memcpy(FIST_IT_RC_Address, mac, 6);
+    memcpy(peerInfo.peer_addr, mac, 6);
+    needToAddPeer = true;
+    LogDebugPRIO("Setting up Fist-IT RC peer");
+    LogDebugFormattedPRIO("Gyro MAC received: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  }
+
+  if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID && FIST_IT_RC_paired) {
+    // Fist-IT RC is already paired, just switch to its peer address
+    memcpy(peerInfo.peer_addr, FIST_IT_RC_Address, 6);
+    //LogDebugPRIO("Switching to Fist-IT RC peer");
+  }
+
+      if (needToAddPeer) {
+      peerInfo.channel = 1;
+      peerInfo.encrypt = false;
+      
+      esp_err_t result = esp_now_add_peer(&peerInfo);
+      if (result == ESP_OK) {
+        LogDebugFormattedPRIO("Peer added: %02X:%02X:%02X:%02X:%02X:%02X from ID %d\n", 
+                          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], incomingcontrol.esp_sender);
+        
+      if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID) {
+          FIST_IT_RC_paired = true;
+          LogDebugPRIO("Fist-IT RC Connected");
+        }
+      }
+      else {
+        LogDebugPRIO("Failed to add peer");
+      }
+    }
+
+        // ALWAYS ALLOW SAFETY STATUS UPDATES - they bypass all safety checks
+    if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID && incomingcontrol.esp_command == FSTOP) {
+      gyroSafetyEngaged = (incomingcontrol.esp_value > 0.5f); // 1=SAFE, 0=ACTIVE
+      LogDebugFormatted("SAFETY: Gyro safety %s\n", gyroSafetyEngaged ? "ENGAGED" : "RELEASED");
+      
+      // Send acknowledgment back to gyro to confirm connection
+      outgoingcontrol.esp_command = FSTOP;
+      outgoingcontrol.esp_value = gyroSafetyEngaged ? 1.0f : 0.0f;
+      outgoingcontrol.esp_target = FIST_IT_GYRO_ID;
+      outgoingcontrol.esp_sender = FIST_ID;
+      esp_now_send(mac, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+      return; // Don't process as movement command
+    }
+    
+    bool allowMovementCommand = true;
+    unsigned long currentTime = millis();
+
+    if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID) {
+      
+      // Check if gyro movement should be blocked by safety system
+      bool m5RecentlyActive = (currentTime - lastM5CommandTime) < DEVICE_TIMEOUT;
+      
+      if (gyroSafetyEngaged) {
+        LogDebugPRIO("SAFETY: Gyro movement blocked - Safety is engaged");
+        allowMovementCommand = false;
+      }
+      else if (m5RecentlyActive) {
+        LogDebugPRIO("SAFETY: Gyro movement blocked - M5 Remote has priority");
+        activeController = M5_ID;
+        allowMovementCommand = false;
+      }
+      else {
+        // Allow gyro control when safety is released AND M5 is inactive
+        activeController = FIST_IT_GYRO_ID;
+        LogDebugFormatted("SAFETY: Gyro movement allowed - M5 inactive and safety released, command: %d\n", incomingcontrol.esp_command);
+      }
+    }
+
+    if (!allowMovementCommand) {
+      LogDebugPRIO("Movement command blocked by safety system");
+      return;
+    }
+          //HANDLE ACTUAL COMMANDS SENT FROM M5 REMOTE
+    
+    if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID) {
+
+      // M5 Remote always has movement priority
+      activeController = FIST_IT_GYRO_ID;
+      LogDebug("SAFETY: Gyro Remote active - has priority control");
+      
+      // Check if M5 is sending a stop command (zero velocity)
+      bool isStopCommand = (abs(incomingcontrol.esp_value) < 0.01f);
+      if (isStopCommand) {
+        // Stop command - clear M5 activity to allow gyro control later
+        activeController = 0;
+        LogDebug("SAFETY: Gyro Remote STOP - clearing priority for gyro connection");
+      }
+    } 
+    // --- Minimal Command Execution ---
+    switch(incomingcontrol.esp_command)
+    {
+
+      case FANGLE: {
+        // Only print debug for new angle/speed from gyro above
+        // Map -180 to +180 degrees directly to steps
+        float angleValue = incomingcontrol.esp_value;
+        if (DirectionInvert) {
+            angleValue = -angleValue;
+        }
+        EndPosition = (int)((stepsPerRotation/360.0) * (angleValue * rotationScale));
+        MotorStatus = ANGLE_MODE;
+        speedValue =  incomingcontrol.esp_speed;;
+        LogDebugPRIO("Angle received: " + String(incomingcontrol.esp_value) + ", Mapped Steps=" + String(EndPosition) + ", Speed=" + String(speedValue));
+        //currentRotationVelocity = incomingcontrol.esp_speed;
+//        LogDebugFormattedPRIO("Current Milis: %lu, FROTATION received: Angle=%.2f, Mapped Steps=%d, RotationScale=%.2f, Velocity=%.2f\n", millis(), incomingcontrol.esp_value, EndPosition, rotationScale, currentRotationVelocity);
+        break;
+      }
+      case FPAUSE: {
+        F_Pause = incomingcontrol.esp_value;
+        break;
+      }
+      case FROTATION_SCALE: {
+        rotationScale = incomingcontrol.esp_value;
+        break;
+      }
+      case FRESPONSIVENESS: {
+        responsivenessLevel = (int)incomingcontrol.esp_value;
+        break;
+      }
+      case FVELOCITY: {
+        // Only print debug for new angle/speed from gyro above
+        currentRotationVelocity = incomingcontrol.esp_value;
+        break;
+      }
+      case ON: {
+        MotorStatus=START;
+        break;
+      }
+      case OFF: {
+        MotorStatus=STOP;
+        break;
+      }
+      case CONNECT:
+      case HEARTBEAT: {
+        outgoingcontrol.esp_target = FIST_IT_GYRO_ID;
+        outgoingcontrol.esp_sender = FIST_ID;
+        outgoingcontrol.esp_command = HEARTBEAT;
+        esp_err_t result = esp_now_send(mac, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+        if (result == ESP_OK) {
+          FIST_IT_RC_paired = true;
+          LogDebugPRIO("Fist-IT RC Connected via HEARTBEAT");}
+        }
+        break;
+    }
+    
+    
+    // Send appropriate response directly to the sender (no peer switching needed for responses)
+    outgoingcontrol.esp_sender = FIST_ID;
+    outgoingcontrol.esp_command = CONNECT;
+    outgoingcontrol.esp_value = 99;
+    outgoingcontrol.esp_target = FIST_IT_GYRO_ID;
+    // Send response directly to sender's MAC address
+    esp_err_t sendResult = esp_now_send(mac, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+
+} 
+
+
+
+
+// Callback when data is received
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  espNowLastRxMs = millis();
+  activeControlMode = MODE_ESPNOW;
+
+    // --- Angle jump protection ---
+    const float MAX_ANGLE_JUMP_DEGREES = 30.0f; // Maximum allowed jump in degrees
+    const int maxAngleJumpSteps = (int)((stepsPerRotation / 360.0f) * (MAX_ANGLE_JUMP_DEGREES * rotationScale * 2));
+  memcpy(&incomingcontrol, incomingData, sizeof(incomingcontrol));
+  LogDebugFormattedPRIO("ESP-NOW RX: sender=%d target=%d cmd=%d value=%.2f len=%d\n",
+                        incomingcontrol.esp_sender,
+                        incomingcontrol.esp_target,
+                        incomingcontrol.esp_command,
+                        incomingcontrol.esp_value,
+                        len);
+
+    // ALWAYS ALLOW CONNECTION AND HEARTBEAT COMMANDS - they establish communication
+    if (incomingcontrol.esp_command == CONNECT || incomingcontrol.esp_command == HEARTBEAT) {
+      LogDebugFormattedPRIO("CONNECT/HB from device %d\n", incomingcontrol.esp_sender);
+
+      // Register M5 as peer HERE - before trying to send back to it
+      if (incomingcontrol.esp_sender == M5_ID && !M5_paired) {
+        esp_now_del_peer(peerInfo.peer_addr);
+        memcpy(M5_Remote_Address, mac, 6);
+        memcpy(peerInfo.peer_addr, mac, 6);
+        peerInfo.channel = 1;
+        peerInfo.encrypt = false;
+        if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+          M5_paired = true;
+          espNowModeLockedByM5 = true;
+          LogDebugPRIO("M5 Remote Connected");
+          LogDebugPRIO("ESP-NOW locked to M5 pair; WiFi/cloud switching disabled");
+        }
+      }
+
+      // Send immediate response to establish connection
+      outgoingcontrol.esp_command = HEARTBEAT; 
+      outgoingcontrol.esp_value = 1.0f;
+      outgoingcontrol.esp_target = incomingcontrol.esp_sender;
+      outgoingcontrol.esp_sender = FIST_ID;
+      outgoingcontrol.esp_connected = true;
+      esp_now_send(mac, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+      return; // Don't process as other commands
+    }
+    
+    // ALWAYS SEND ACKNOWLEDGMENTS FOR CONNECTION HEARTBEATS
+    if (incomingcontrol.esp_heartbeat) {
+      // Send heartbeat response to confirm connection is alive
+      outgoingcontrol.esp_heartbeat = true;
+      outgoingcontrol.esp_connected = true;
+      outgoingcontrol.esp_target = incomingcontrol.esp_sender;
+      outgoingcontrol.esp_sender = FIST_ID;
+      esp_now_send(mac, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+      LogDebugFormattedPRIO("Heartbeat response sent to device %d\n", incomingcontrol.esp_sender);
+    }
+
+
+    // Use received esp_speed for motor control (minimal change)
+    // For gyro, always update velocity and angle if present
+    if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID) {
+      LogDebug("Gyro data received from FIST_IT_GYRO_ID");
+      OnDataRecvGYRO(mac, incomingData, len);
+
+    }
+
+  // SMART PEER MANAGEMENT: Only add peer if not already paired
+  if(incomingcontrol.esp_target == FIST_ID) {
+    
+    bool needToAddPeer = false;
+    
+    if (incomingcontrol.esp_sender == M5_ID && !M5_paired) {
+      // M5 Remote trying to connect for first time
+      esp_now_del_peer(peerInfo.peer_addr); // Clear any existing peer
+      memcpy(M5_Remote_Address, mac, 6);
+      memcpy(peerInfo.peer_addr, mac, 6);
+      needToAddPeer = true;
+      LogDebugPRIO("Setting up M5 Remote peer");
+    }
+    else if (incomingcontrol.esp_sender == M5_ID && M5_paired) {
+      // M5 is already paired, just switch to its peer address
+      memcpy(peerInfo.peer_addr, M5_Remote_Address, 6);
+      LogDebugPRIO("Switching to M5 Remote peer");
+    }
+    
+    if (needToAddPeer) {
+      peerInfo.channel = 1;
+      peerInfo.encrypt = false;
+      
+      esp_err_t result = esp_now_add_peer(&peerInfo);
+      if (result == ESP_OK) {
+        LogDebugFormattedPRIO("Peer added: %02X:%02X:%02X:%02X:%02X:%02X from ID %d\n", 
+                          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], incomingcontrol.esp_sender);
+        
+        if (incomingcontrol.esp_sender == M5_ID) {
+          M5_paired = true;
+          espNowModeLockedByM5 = true;
+          LogDebugPRIO("M5 Remote Connected");
+          LogDebugPRIO("ESP-NOW locked to M5 pair; WiFi/cloud switching disabled");
+        } 
+        else if (incomingcontrol.esp_sender == OSSM_ID) {
+          OSSM_paired = true;
+          LogDebug("OSSM Stroke Engine Connected!");
+        }
+      }
+      else {
+        LogDebugPRIO("Failed to add peer");
+      }
+    }
+    // End peer management block
+    
+    // SAFETY SYSTEM: Check if movement commands should be processed
+    bool allowMovementCommand = true;
+    unsigned long currentTime = millis();
+    
+    if (incomingcontrol.esp_sender == M5_ID) {
+      // M5 Remote always has movement priority
+      lastM5CommandTime = currentTime;
+      activeController = M5_ID;
+      LogDebug("SAFETY: M5 Remote active - has priority control");
+      
+      // Check if M5 is sending a stop command (zero velocity)
+      bool isStopCommand = (abs(incomingcontrol.esp_value) < 0.01f);
+      if (isStopCommand) {
+        // Stop command - clear M5 activity to allow gyro control later
+        lastM5CommandTime = 0;
+        activeController = 0;
+        LogDebug("SAFETY: M5 Remote STOP - clearing priority for gyro connection");
+      }
+    } 
+    
+    // Process movement commands only if safety allows
+    if (!allowMovementCommand) {
+      LogDebug("Movement command blocked by safety system");
+      return;
+    }
+
+    //HANDLE ACTUAL COMMANDS SENT FROM M5 REMOTE
+
+    // --- Minimal Command Execution ---
+    switch(incomingcontrol.esp_command)
+    {
+      case FSPEED: {
+        float m5SpeedRaw = incomingcontrol.esp_value;
+        speedValue = m5SpeedRaw / 500.0f * maxSpeedHz;
+        // Recalculate SensationValue using lastSensationPercent and sensationScale
+        SensationValue = (int)(speedValue * (lastSensationPercent / 100.0f) * sensationScale);
+        LogDebug(String("[M5 DEBUG] SPEED: raw=") + String(m5SpeedRaw) + ", mapped speedValue=" + String(speedValue) + ", SensationValue recalculated=" + String(SensationValue) + " (" + String(lastSensationPercent) + "% of speedValue, scale=" + String(sensationScale) + ")");
+        break;
+      }
+      case SPEED: {
+        float m5SpeedRaw = incomingcontrol.esp_value;
+        speedValue = m5SpeedRaw / 100.0f * maxSpeedHz;
+        // Recalculate SensationValue using lastSensationPercent and sensationScale
+        SensationValue = (int)(speedValue * (lastSensationPercent / 100.0f) * sensationScale);
+        LogDebug(String("[M5 DEBUG] SPEED: raw=") + String(m5SpeedRaw) + ", mapped speedValue=" + String(speedValue) + ", SensationValue recalculated=" + String(SensationValue) + " (" + String(lastSensationPercent) + "% of speedValue, scale=" + String(sensationScale) + ")");
+        break;
+      }
+      case FROTATION: {
+        // M5 rotation is an absolute angle command; run as ANGLE_MODE (not oscillating START mode)
+        EndPosition = (int)((stepsPerRotation / 360.0f) * (incomingcontrol.esp_value * rotationScale * m5RotationTurnScale));
+        MotorStatus = ANGLE_MODE;
+        break;
+      }
+      case FPAUSE: {
+        F_Pause = incomingcontrol.esp_value;
+        break;
+      }
+      case FSENSATION: {
+        LogDebug("FSENSATION command received");
+        // SensationValue is a percentage of speedValue, scaled by sensationScale
+        float requestedPercent = incomingcontrol.esp_value; // 0-100 from remote
+        lastSensationPercent = requestedPercent;
+        SensationValue = (int)(speedValue * (requestedPercent / 100.0f) * sensationScale);
+        LogDebug(String("[FSENSATION] SensationValue=") + String(SensationValue) + " (" + String(requestedPercent) + "% of speedValue=" + String(speedValue) + ", scale=" + String(sensationScale) + ")");
+        break;
+      }
+      case FANGLE: {
+        // FANGLE removed: Only FROTATION is used for gyro control
+        break;
+      }
+      case FROTATION_SCALE: {
+        rotationScale = incomingcontrol.esp_value;
+        break;
+      }
+      case FRESPONSIVENESS: {
+        responsivenessLevel = (int)incomingcontrol.esp_value;
+        break;
+      }
+      case FVELOCITY: {
+        // Only print debug for new angle/speed from gyro above
+        currentRotationVelocity = incomingcontrol.esp_value;
+        break;
+      }
+      case ON: {
+        MotorStatus=START;
+        break;
+      }
+      case OFF: {
+        MotorStatus=STOP;
+        break;
+      }
+      case CONNECT:
+      case HEARTBEAT: {
+        // ...existing code...
+        if (incomingcontrol.esp_sender == M5_ID) {
+          outgoingcontrol.esp_target = M5_ID;
+          outgoingcontrol.esp_sender = FIST_ID;
+          outgoingcontrol.esp_command = HEARTBEAT;
+          esp_err_t result = esp_now_send(M5_Remote_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+          if (result == ESP_OK) {
+            M5_paired = true;
+            espNowModeLockedByM5 = true;
+            LogDebugPRIO("ESP-NOW locked to M5 pair; WiFi/cloud switching disabled");
+          }
+        }
+        else if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID) {
+          outgoingcontrol.esp_target = FIST_IT_GYRO_ID;
+          outgoingcontrol.esp_sender = FIST_ID;
+          outgoingcontrol.esp_command = HEARTBEAT;
+          esp_err_t result = esp_now_send(mac, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+          if (result == ESP_OK) {
+            FIST_IT_RC_paired = true;
+          }
+        }
+        break;
+      }
+    }
+    
+    // Send appropriate response directly to the sender (no peer switching needed for responses)
+    outgoingcontrol.esp_sender = FIST_ID;
+    outgoingcontrol.esp_command = CONNECT;
+    outgoingcontrol.esp_value = 99;
+    
+    if (incomingcontrol.esp_sender == M5_ID) {
+      outgoingcontrol.esp_target = M5_ID;
+    } else if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID) {
+      outgoingcontrol.esp_target = FIST_IT_GYRO_ID;
+    }
+    
+    // Send response directly to sender's MAC address
+    esp_err_t sendResult = esp_now_send(mac, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+
+  } 
+} // Close OnDataRecv function
+
+
+// Initialize ESP-NOW communication
+void setupESPNow() {
+    // WiFi setup is now done during splash screen, so skip setupWiFiManager()
+    
+    // Get the actual WiFi channel and use it for ESP-NOW
+    int32_t actualChannel;
+    if (WiFi.status() == WL_CONNECTED) {
+        actualChannel = WiFi.channel();
+        LogDebugFormattedPRIO("WiFi network '%s' is on channel: %d\n", WiFi.SSID().c_str(), actualChannel);
+    } else {
+        // If not connected to WiFi, use default channel 1
+        actualChannel = 1;
+        LogDebugPRIO("WiFi not connected, using default channel 1 for ESP-NOW");
+    }
+    
+    // Set ESP-NOW to use the determined channel
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(actualChannel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+    
+    LogDebugFormattedPRIO("ESP-NOW channel set to: %d (matches WiFi)\n", actualChannel);
+    
+    // Print our own MAC address for reference
+    //Serial.print("Fist-IT Gyro Controller MAC: ");
+    LogDebugPRIO(WiFi.macAddress());
+    
+    // Initialize ESP-NOW
+    //Serial.print("Initializing ESP-NOW... ");
+    if (esp_now_init() != ESP_OK) {
+        LogDebug("Error initializing ESP-NOW");
+        return;
+    }
+    LogDebug("Success!");
+    
+    // Register callback functions
+      esp_now_register_send_cb(OnDataSent);
+  
+      // Initialize single dynamic peer info structure
+      memset(&peerInfo, 0, sizeof(peerInfo));
+      //      //peerInfo.channel = actualChannel;
+      peerInfo.channel = 1;
+      peerInfo.encrypt = false;
+    
+      // Register for a callback function that will be called when data is received
+      esp_now_register_recv_cb(OnDataRecv);
+    
+    // Set up broadcast peer for initial discovery
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = 1;
+    peerInfo.encrypt = false;
+    
+    // Add broadcast peer
+    esp_err_t peerResult = esp_now_add_peer(&peerInfo);
+    if (peerResult != ESP_OK) {
+        LogDebugFormatted("Failed to add broadcast peer, error: %d\n", peerResult);
+        return;
+    }
+    
+    LogDebugPRIO("ESP-NOW initialized with broadcast peer");
+    LogDebug("Sending discovery messages to find devices...");
+    
+}
+
+void setup(void) {
+  Serial.begin(115200);
+
+  LogDebugPRIO("ESP-NOW pairing-first mode enabled");
+  LogDebugFormattedPRIO("Waiting up to %lu ms for M5 pairing before WiFi/XToys fallback\n", ESPNOW_PAIRING_TIMEOUT_MS);
+  espNowEnabled = false;
+  enableEspNowMode();
+
+
+  // WiFiManager setup for automatic network configuration
+  // WiFiManager wifiManager;
+  // WiFi.setHostname("fist-it");
+  // wifiManager.setConfigPortalTimeout(300);
+  // wifiManager.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+
+  // LogDebug("=== Fist-IT Motor WiFi Configuration ===");
+  // LogDebug("If WiFi connection fails, connect to hotspot:");
+  // LogDebug("Network: FistIT-Motor-Config");
+  // LogDebug("URL: http://192.168.4.1");
+  // LogDebug("OR: http://fist-it/wifi (once connected to WiFi)");
+  // LogDebug("=======================================");
+
+  // Try to connect to saved WiFi, or start config portal
+  // if (!wifiManager.autoConnect("FistIT-Motor-Config")) {
+  //   LogDebug("Failed to connect WiFi, restarting...");
+  //   ESP.restart();
+  // }
+
+
+  
+  pinMode(enablePinStepper, OUTPUT);
+  digitalWrite(enablePinStepper, HIGH);
+  if (LVpin >= 0 && LVpin <= 21) {
+    pinMode(LVpin, OUTPUT);
+    digitalWrite(LVpin, HIGH);
+  } else {
+    LogDebugPRIO("LV pin disabled (invalid pin configured)");
+  }
+    
+  
+  engine.init();
+  stepper = engine.stepperConnectToPin(stepPinStepper);
+  if (stepper) {
+    stepper->setDirectionPin(dirPinStepper);
+    stepper->setEnablePin(enablePinStepper);
+    stepper->setAutoEnable(true);
+    stepper->setDelayToDisable(5000);
+    int MaxSpeedTicks = stepper->getMaxSpeedInTicks();
+    LogDebug("Max Speed in Ticks (FastAccelStepper): ");
+    LogDebug(MaxSpeedTicks);
+    // Set current position to zero at startup
+    stepper->setCurrentPosition(0);
+    LogDebugPRIO("Stepper current position set to 0 at startup");
+  }
+
+    //test to show board works 
+    stepper->setSpeedInHz(10000);
+    stepper->setAcceleration(10000);
+    stepper->setCurrentPosition(500);
+    stepper->moveTo(0);
+  
+  
+      //Send first heartbeat to M5 remote
+  
+      if(espNowEnabled && !M5_paired){
+        LogDebug("Sending first heartbeat");
+        LogDebugFormatted("to M5 remote addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", M5_Remote_Address[0], M5_Remote_Address[1], M5_Remote_Address[2], M5_Remote_Address[3], M5_Remote_Address[4], M5_Remote_Address[5]);
+  
+        outgoingcontrol.esp_command = HEARTBEAT;
+        outgoingcontrol.esp_heartbeat = true;
+        outgoingcontrol.esp_target = M5_ID;
+        outgoingcontrol.esp_sender = FIST_ID;
+        esp_err_t result = esp_now_send(M5_Remote_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+        if (result == !ESP_OK) {
+          LogDebug("Sending to M5 failed (not paired)");
+        }
+  
+      }
+
+      // ESP-NOW heartbeat task is started by enableEspNowMode().
+  //delay(200);
+}
+
+void setupXToysWebSocket() {
+  if (xtoysLocalServerStarted) {
+    return;
+  }
+  xtoysWebSocket.begin();
+  xtoysWebSocket.onEvent(xtoysWebSocketEvent);
+  xtoysLocalServerStarted = true;
+  LogDebugFormattedPRIO("XToys WebSocket server listening at ws://%s:%d\n", WiFi.softAPIP().toString().c_str(), XTOYS_WEBSOCKET_PORT);
+}
+
+void startXToysAccessPoint(int channel) {
+  WiFi.softAPdisconnect(true);
+
+  bool started;
+  if (channel > 0) {
+    started = WiFi.softAP("FistIT-XToys", nullptr, channel);
+  } else {
+    started = WiFi.softAP("FistIT-XToys");
+  }
+
+  if (started) {
+    LogDebugFormattedPRIO("XToys AP started. SSID: FistIT-XToys, IP: %s\n", WiFi.softAPIP().toString().c_str());
+  } else {
+    LogDebugPRIO("Failed to start XToys AP");
+  }
+}
+
+bool connectWiFiForInternet() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("fist-it");
+
+  WiFiManager wifiManager;
+  wifiManager.setConfigPortalTimeout(180);
+  wifiManager.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+  LogDebugPRIO("Open AP FistIT-Setup to configure Wi-Fi if no saved network is available");
+  LogDebugPRIO("The captive portal may open automatically on your phone.");
+  LogDebugPRIO("If it does not open automatically, browse to http://192.168.4.1");
+  bool connected = wifiManager.autoConnect("FistIT-Setup");
+  if (connected) {
+    LogDebugFormattedPRIO("WiFi connected: %s | IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    LogDebugFormattedPRIO("Connected to SSID: %s\n", WiFi.SSID().c_str());
+  } else {
+    LogDebugPRIO("WiFi STA not connected. Continuing with local AP mode.");
+  }
+  return connected;
+}
+
+bool reconnectSavedWiFiForCloud() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setHostname("fist-it");
+  startXToysAccessPoint(0);
+  WiFi.begin();
+
+  unsigned long startMs = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < 8000) {
+    delay(100);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    LogDebugFormattedPRIO("WiFi reconnected: %s | IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    startXToysAccessPoint(WiFi.channel());
+    return true;
+  }
+
+  LogDebugPRIO("Saved WiFi reconnect failed. Staying in ESP-NOW mode on channel 1.");
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP);
+  startXToysAccessPoint(1);
+  return false;
+}
+
+void enableEspNowMode() {
+  if (espNowEnabled && eRemote_t != nullptr) {
+    return;
+  }
+
+  xtoysCloudConnected = false;
+  xtoysCloudHasPayload = false;
+  xtoysCloudWebSocket.disconnect();
+  xtoysCloudInitialized = false;
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_STA);
+
+  espNowEnabled = true;
+  espNowLastRxMs = millis();
+  if (!espNowModeLockedByM5) {
+    espNowPairingStartMs = millis();
+  }
+  setupESPNow();
+  if (eRemote_t == nullptr) {
+    xTaskCreatePinnedToCore(espNowRemoteTask,
+                          "espNowRemoteTask",
+                          3096,
+                          NULL,
+                          5,
+                          &eRemote_t,
+                          0);
+  }
+  activeControlMode = MODE_ESPNOW;
+  LogDebugPRIO("ESP-NOW mode enabled");
+}
+
+void disableEspNowMode() {
+  if (!espNowEnabled) {
+    return;
+  }
+  espNowEnabled = false;
+  if (eRemote_t != nullptr) {
+    vTaskDelete(eRemote_t);
+    eRemote_t = nullptr;
+  }
+  esp_now_deinit();
+  M5_paired = false;
+  FIST_IT_RC_paired = false;
+  OSSM_paired = false;
+  LogDebugPRIO("ESP-NOW mode disabled");
+}
+
+void waitForInitialCloudConnection() {
+  if (strlen(XTOYS_WEBHOOK_ID) == 0 || WiFi.status() != WL_CONNECTED) {
+    enableEspNowMode();
+    LogDebugPRIO("Falling back to M5 mode");
+    return;
+  }
+
+  setupXToysCloudWebSocket();
+  unsigned long startMs = millis();
+  while (!xtoysCloudHasPayload && (millis() - startMs) < 8000) {
+    xtoysCloudWebSocket.loop();
+    delay(10);
+  }
+
+  if (xtoysCloudConnected && xtoysCloudHasPayload) {
+    disableEspNowMode();
+    activeControlMode = MODE_CLOUD;
+    LogDebugPRIO("Auto mode selected CLOUD control");
+    LogDebugPRIO("Connected to XToys cloud");
+  } else {
+    enableEspNowMode();
+    activeControlMode = MODE_ESPNOW;
+    LogDebugPRIO("Auto mode selected ESP-NOW control");
+    LogDebugPRIO("Falling back to M5 mode");
+  }
+}
+
+void handleAutoModeTransitions() {
+  // LOCKED: M5 has paired; never switch away from ESP-NOW
+  if (espNowModeLockedByM5) {
+    return;
+  }
+
+  // PAIRING WINDOW: waiting for M5 to pair within timeout
+  if (activeControlMode == MODE_ESPNOW && !M5_paired) {
+    if ((millis() - espNowPairingStartMs) < ESPNOW_PAIRING_TIMEOUT_MS) {
+      return;  // still in pairing window, keep waiting
+    }
+    // Pairing timed out — fall back to WiFi/XToys (runs exactly once)
+    espNowPairingStartMs = ULONG_MAX;  // prevent re-entry
+    LogDebugPRIO("ESP-NOW pairing timeout; switching to WiFi/XToys mode");
+    disableEspNowMode();
+    activeControlMode = MODE_CLOUD;   // move out of ESPNOW branch immediately
+    if (!reconnectSavedWiFiForCloud()) {
+      // No WiFi available — stay in ESP-NOW
+      enableEspNowMode();
+      activeControlMode = MODE_ESPNOW;
+      espNowPairingStartMs = ULONG_MAX;  // still block re-entry
+      return;
+    }
+    WiFi.mode(WIFI_AP_STA);
+    startXToysAccessPoint(WiFi.channel());
+    MDNS.begin("fist-it");
+    setupXToysWebSocket();
+    if (!xtoysCloudInitialized) {
+      setupXToysCloudWebSocket();
+    }
+    return;
+  }
+
+  // CLOUD mode management
+  if (activeControlMode == MODE_CLOUD) {
+    xtoysCloudWebSocket.loop();
+
+    if (xtoysCloudConnected && (millis() - xtoysLastCloudRxMs) > CLOUD_RX_INACTIVITY_FALLBACK_MS) {
+      LogDebugPRIO("Cloud connection idle; switching back to ESP-NOW mode");
+      enableEspNowMode();
+      activeControlMode = MODE_ESPNOW;
+      return;
+    }
+
+    if (!xtoysCloudConnected && (millis() - lastCloudRetryMs) > CLOUD_RETRY_INTERVAL_MS) {
+      lastCloudRetryMs = millis();
+      if (!xtoysCloudInitialized && WiFi.status() == WL_CONNECTED) {
+        setupXToysCloudWebSocket();
+      }
+      xtoysCloudWebSocket.loop();
+      if (!xtoysCloudConnected) {
+        enableEspNowMode();
+        activeControlMode = MODE_ESPNOW;
+        LogDebugPRIO("Cloud lost; returning to ESP-NOW mode");
+      }
+    }
+  }
+}
+
+void setupXToysCloudWebSocket() {
+  if (xtoysCloudInitialized) {
+    return;
+  }
+  if (strlen(XTOYS_WEBHOOK_ID) == 0) {
+    LogDebugPRIO("XToys cloud mode disabled (XTOYS_WEBHOOK_ID is empty)");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    LogDebugPRIO("XToys cloud mode not started (no WiFi internet connection)");
+    return;
+  }
+
+  xtoysCloudPath = "/" + String(XTOYS_WEBHOOK_ID);
+  xtoysCloudWebSocket.beginSSL("webhook.xtoys.app", 443, xtoysCloudPath.c_str());
+  xtoysCloudWebSocket.setReconnectInterval(5000);
+  xtoysCloudWebSocket.onEvent(xtoysCloudWebSocketEvent);
+
+  if (strlen(XTOYS_WEBHOOK_AUTH_TOKEN) > 0) {
+    xtoysCloudHeaders = "Authorization: Bearer " + String(XTOYS_WEBHOOK_AUTH_TOKEN) + "\r\n";
+    xtoysCloudWebSocket.setExtraHeaders(xtoysCloudHeaders.c_str());
+  }
+
+  xtoysCloudInitialized = true;
+
+  LogDebugFormattedPRIO("XToys cloud websocket connecting to wss://webhook.xtoys.app%s\n", xtoysCloudPath.c_str());
+}
+
+void xtoysCloudWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      xtoysCloudConnected = true;
+      LogDebugPRIO("XToys cloud websocket connected");
+      break;
+    case WStype_DISCONNECTED:
+      xtoysCloudConnected = false;
+      xtoysCloudHasPayload = false;
+      LogDebugPRIO("XToys cloud websocket disconnected");
+      break;
+    case WStype_TEXT:
+      if (payload && length > 0) {
+        LogDebugFormattedPRIO("XToys cloud RX: %s\n", (char *)payload);
+        processXToysJsonCommand(String((char *)payload));
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+void xtoysWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED: {
+      IPAddress ip = xtoysWebSocket.remoteIP(num);
+      LogDebugFormattedPRIO("XToys client connected [%u] from %s\n", num, ip.toString().c_str());
+
+      JsonDocument hello;
+      hello["id"] = xtoysIdentifier;
+      hello["status"] = "connected";
+      hello["firmware"] = "Fist-IT";
+      String out;
+      serializeJson(hello, out);
+      xtoysWebSocket.sendTXT(num, out);
+      break;
+    }
+    case WStype_DISCONNECTED:
+      LogDebugFormattedPRIO("XToys client disconnected [%u]\n", num);
+      break;
+    case WStype_TEXT:
+      if (length > 0) {
+        unsigned long now = millis();
+        if (now - xtoysLastMessageMs >= (1000 / XTOYS_MAX_MSG_PER_SEC)) {
+          xtoysLastMessageMs = now;
+          LogDebugFormattedPRIO("XToys local RX: %s\n", (char *)payload);
+          processXToysJsonCommand(String((char *)payload));
+        }
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+void processXToysJsonCommand(const String &jsonPayload) {
+  LogDebugFormattedPRIO("XToys JSON payload: %s\n", jsonPayload.c_str());
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, jsonPayload);
+  if (err) {
+    LogDebugFormatted("XToys JSON parse error: %s\n", err.c_str());
+    return;
+  }
+
+  const char *incomingId = doc["id"];
+  if (incomingId != nullptr && xtoysIdentifier.length() > 0 && String(incomingId) != xtoysIdentifier) {
+    LogDebugFormatted("XToys message ignored due to ID mismatch: %s\n", incomingId);
+    return;
+  }
+
+  auto isTruthyValue = [](const String &v) {
+    String lower = v;
+    lower.toLowerCase();
+    return (lower == "1" || lower == "true" || lower == "on");
+  };
+
+  JsonObject obj = doc.as<JsonObject>();
+
+  bool connectRequested = false;
+  bool connectDisabled = false;
+  for (JsonPair kv : obj) {
+    String key = kv.key().c_str();
+    key.toLowerCase();
+    if (key != "connect") {
+      continue;
+    }
+
+    String value;
+    if (kv.value().is<const char *>()) {
+      value = kv.value().as<const char *>();
+    } else if (kv.value().is<int>()) {
+      value = String(kv.value().as<int>());
+    } else if (kv.value().is<float>()) {
+      value = String(kv.value().as<float>(), 3);
+    } else if (kv.value().is<bool>()) {
+      value = kv.value().as<bool>() ? "1" : "0";
+    } else {
+      continue;
+    }
+
+    if (isTruthyValue(value)) {
+      connectRequested = true;
+    } else {
+      connectDisabled = true;
+    }
+  }
+
+  if (connectRequested) {
+    xtoysCloudHasPayload = true;
+    xtoysLastCloudRxMs = millis();
+    activeControlMode = MODE_CLOUD;
+    LogDebugPRIO("XToys Connect=1 received; cloud control armed");
+  } else if (connectDisabled) {
+    xtoysCloudHasPayload = false;
+    xtoysRampActive = false;
+    MotorStatus = STOP;
+    enableEspNowMode();
+    activeControlMode = MODE_ESPNOW;
+    LogDebugPRIO("XToys Connect=0 received; switched back to ESP-NOW mode");
+  }
+
+  for (JsonPair kv : obj) {
+    String key = kv.key().c_str();
+    if (key == "id") {
+      continue;
+    }
+
+    String value;
+    if (kv.value().is<const char *>()) {
+      value = kv.value().as<const char *>();
+    } else if (kv.value().is<int>()) {
+      value = String(kv.value().as<int>());
+    } else if (kv.value().is<float>()) {
+      value = String(kv.value().as<float>(), 3);
+    } else if (kv.value().is<bool>()) {
+      value = kv.value().as<bool>() ? "1" : "0";
+    } else {
+      continue;
+    }
+
+    String lowerKey = key;
+    lowerKey.toLowerCase();
+    if (lowerKey == "connect") {
+      continue;
+    }
+
+    if (!xtoysCloudHasPayload) {
+      LogDebugFormattedPRIO("XToys command ignored until Connect=1: %s=%s\n", key.c_str(), value.c_str());
+      continue;
+    }
+
+    applyXToysCommand(key, value);
+    LogDebugFormattedPRIO("XToys command applied: %s=%s\n", key.c_str(), value.c_str());
+  }
+}
+
+void applyXToysCommand(const String &key, const String &value) {
+  String command = key;
+  command.toLowerCase();
+  float numericValue = value.toFloat();
+
+  auto startXToysRampForTarget = [&]() {
+    if (!stepper) {
+      xtoysRampActive = false;
+      return;
+    }
+    xtoysRampStartPosition = stepper->getCurrentPosition();
+    xtoysRampTargetPosition = EndPosition;
+    xtoysRampTotalSteps = labs((long)xtoysRampTargetPosition - (long)xtoysRampStartPosition);
+    xtoysRampActive = (xtoysForceLevel < 5) && (xtoysRampTotalSteps > 0);
+  };
+
+  if (command == "intensity" || command == "speed") {
+    float percent = constrain(numericValue, 0.0f, 100.0f);
+    speedValue = (int)(percent / 100.0f * maxSpeedHz);
+    SensationValue = (int)(speedValue * (lastSensationPercent / 100.0f) * sensationScale);
+    MotorStatus = (percent <= 0.01f) ? STOP : START;
+    return;
+  }
+
+  if (command == "depth" || command == "rotation") {
+    // Map depth percent (0-100) to angle (0-180 deg) for predictable XToys behavior.
+    float angleValue;
+    if (command == "rotation") {
+      angleValue = constrain(numericValue, 0.0f, 180.0f) * XTOYS_ANGLE_SCALE;
+    } else {
+      float percent = constrain(numericValue, 0.0f, 100.0f);
+      angleValue = percent * 1.8f * XTOYS_ANGLE_SCALE;
+    }
+    if (DirectionInvert) {
+      angleValue = -angleValue;
+    }
+    EndPosition = (int)((stepsPerRotation / 360.0f) * (angleValue * rotationScale));
+    MotorStatus = ANGLE_MODE;
+    startXToysRampForTarget();
+    return;
+  }
+
+  if (command == "angle") {
+    float angleValue = constrain(numericValue, -180.0f, 180.0f);
+    angleValue *= XTOYS_ANGLE_SCALE;
+    if (DirectionInvert) {
+      angleValue = -angleValue;
+    }
+    EndPosition = (int)((stepsPerRotation / 360.0f) * (angleValue * rotationScale));
+    MotorStatus = ANGLE_MODE;
+    startXToysRampForTarget();
+    return;
+  }
+
+  if (command == "force" || command == "accel") {
+    xtoysForceLevel = constrain((int)numericValue, 0, 5);
+    return;
+  }
+
+  if (command == "sensation") {
+    float requestedPercent = constrain(numericValue, 0.0f, 100.0f);
+    lastSensationPercent = requestedPercent;
+    SensationValue = (int)(speedValue * (requestedPercent / 100.0f) * sensationScale);
+    return;
+  }
+
+  if (command == "pause") {
+    F_Pause = (int)max(0.0f, numericValue);
+    return;
+  }
+
+  if (command == "rotation_scale") {
+    rotationScale = constrain(numericValue, 0.1f, 4.0f);
+    return;
+  }
+
+  if (command == "stop" || command == "safe") {
+    bool engaged = (value == "1" || value == "true" || value == "on");
+    gyroSafetyEngaged = engaged;
+    if (engaged) {
+      MotorStatus = STOP;
+      if (stepper) {
+        stepper->forceStop();
+        stepper->setCurrentPosition(0);
+      }
+      EndPosition = 0;
+      xtoysRampActive = false;
+    }
+    return;
+  }
+
+  if (command == "on" || command == "start" || command == "startfist") {
+    bool active = (value == "1" || value == "true" || value == "on");
+    MotorStatus = active ? START : STOP;
+    if (!active) {
+      xtoysRampActive = false;
+    }
+    return;
+  }
+
+  if (command == "zero" || command == "recenter") {
+    bool shouldZero = (value == "1" || value == "true" || value == "on");
+    if (shouldZero && stepper) {
+      stepper->forceStop();
+      stepper->setCurrentPosition(0);
+      EndPosition = 0;
+      MotorStatus = ANGLE_MODE;
+      xtoysRampActive = false;
+    }
+    return;
+  }
+}
+
+void broadcastXToysStatus() {
+  unsigned long now = millis();
+  if (now - xtoysLastStatusBroadcastMs < 250) {
+    return;
+  }
+  xtoysLastStatusBroadcastMs = now;
+
+  JsonDocument status;
+  status["id"] = xtoysIdentifier;
+  status["position"] = String(stepper ? stepper->getCurrentPosition() : 0);
+  status["target"] = String(EndPosition);
+  status["status"] = String(MotorStatus);
+  status["safety"] = gyroSafetyEngaged ? "1" : "0";
+  status["connected"] = "1";
+
+  String out;
+  serializeJson(status, out);
+  xtoysWebSocket.broadcastTXT(out);
+}
+
+void espNowRemoteTask(void *pvParameters)
+{
+  for(;;){
+      //CheckAllPeers;
+      if(M5_paired){
+      LogDebug("Heartbeat M5");
+//      LogDebugFormatted("OSSM addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", OSSM_Address[0], OSSM_Address[1], OSSM_Address[2], OSSM_Address[3], OSSM_Address[4], OSSM_Address[5]);
+      outgoingcontrol.esp_command = HEARTBEAT;
+      outgoingcontrol.esp_sender = FIST_ID;
+      outgoingcontrol.esp_heartbeat = true;
+      outgoingcontrol.esp_target = M5_ID;
+      esp_err_t result = esp_now_send(M5_Remote_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+      if (result == ESP_OK) {
+//        LogDebug("Sent ok");
+      } 
+      else {
+        LogDebug("failed to send heartbeat");
+      }
+    }
+    
+    // Send heartbeat to Fist-IT RC if paired
+    if(FIST_IT_RC_paired){
+      LogDebug("Heartbeat Fist-IT RC");
+      // Re-add direct peer for Fist-IT Gyro before sending
+      esp_now_del_peer(FIST_IT_RC_Address); // Remove if already exists
+      memset(&peerInfo, 0, sizeof(peerInfo));
+      memcpy(peerInfo.peer_addr, FIST_IT_RC_Address, 6);
+      peerInfo.channel = 1;
+      peerInfo.encrypt = false;
+      esp_now_add_peer(&peerInfo);
+      outgoingcontrol.esp_command = HEARTBEAT;
+      outgoingcontrol.esp_sender = FIST_ID;
+      outgoingcontrol.esp_heartbeat = true;
+      outgoingcontrol.esp_target = FIST_IT_GYRO_ID;
+      esp_err_t result = esp_now_send(FIST_IT_RC_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+      if (result == ESP_OK) {
+        LogDebug("Fist-IT RC Heartbeat sent ok");
+      } 
+      else {
+        LogDebugFormatted("failed to send Fist-IT Gyro heartbeat with MAC Address: %02X:%02X:%02X:%02X:%02X:%02X\n", FIST_IT_RC_Address[0], FIST_IT_RC_Address[1], FIST_IT_RC_Address[2], FIST_IT_RC_Address[3], FIST_IT_RC_Address[4], FIST_IT_RC_Address[5]);
+      }
+    }
+    
+    //delay(200);
+    // Only broadcast discovery heartbeat when no peers are paired yet
+    if (!M5_paired && !FIST_IT_RC_paired) {
+      LogDebug("Heartbeat ALL (discovery)");
+      LogDebugFormatted("on wifi channel : %d\n", WiFi.channel());
+      outgoingcontrol.esp_command = HEARTBEAT;
+      outgoingcontrol.esp_sender = FIST_ID;
+      outgoingcontrol.esp_heartbeat = true;
+      outgoingcontrol.esp_target = FIST_IT_GYRO_ID;  // Target FIST_IT_GYRO_ID for discovery pairing
+      esp_now_send(DEFAULT_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+    }
+    //StatusMessageOut();
+
+    //problem when adding if Fist-IT not paired
+    vTaskDelay(HEARTBEAT_INTERVAL);
+  }
+}
+
+void moveFromM5Remote(){
+  // Function to handle movement commands from M5 Remote
+  // Currently integrated into OnDataRecv for minimal changes
+  
+  if (MotorStatus == START) {
+    // M5 remote: use speedValue and SensationValue for speed/accel
+    //LogDebugPRIO(String("[M5 DEBUG] MotorStatus=START, speedValue=") + String(speedValue) + ", SensationValue=" + String(SensationValue));
+    int multiplier = 1;
+    int speedHz = speedValue * multiplier;
+    int accel = SensationValue * multiplier;
+    if (speedHz < minSpeedHz) speedHz = minSpeedHz;
+    if (speedHz > maxSpeedHz) speedHz = maxSpeedHz;
+    if (accel < 100) accel = 100;
+    if (accel > maxSpeedHz) accel = maxSpeedHz;
+    //if (accel > 40000) accel = 40000;
+    //LogDebugPRIO(String("[M5 DEBUG] Calculated speedHz: ") + String(speedHz) + ", accel: " + String(accel));
+    //LogDebugPRIO(String("[M5 DEBUG] CurrentPosition: ") + String(stepper->getCurrentPosition()));
+    stepper->setSpeedInHz(speedHz);
+    stepper->setAcceleration(accel);
+    // Oscillate between EndPosition and StartPosition with blocking pause after each move
+    if (stepper->targetPos() == stepper->getCurrentPosition()) {
+      if (stepper->getCurrentPosition() == StartPosition) {
+        stepper->moveTo(EndPosition);
+        LogDebugPRIO("[M5 DEBUG] Moving to EndPosition: " + String(EndPosition) + " Pause time = " + String(F_Pause));
+        delay(F_Pause * 100);
+      } else if (stepper->getCurrentPosition() == EndPosition) {
+        stepper->moveTo(StartPosition);
+        LogDebugPRIO("[M5 DEBUG] Moving to StartPosition: " + String(StartPosition) + " Pause time = " + String(F_Pause));
+        delay(F_Pause * 100);
+      } else if (stepper->getCurrentPosition() < EndPosition) {
+        stepper->moveTo(EndPosition);
+        LogDebugPRIO("[M5 DEBUG] Moving to EndPosition: " + String(EndPosition) + " Pause time = " + String(F_Pause));
+        delay(F_Pause * 100);
+      } else {
+        stepper->moveTo(StartPosition);
+        LogDebugPRIO("[M5 DEBUG] Moving to StartPosition: " + String(StartPosition) + " Pause time = " + String(F_Pause));
+        delay(F_Pause * 100);
+      }
+    }
+  }
+}
+
+
+void moveFromGyro(){
+  if (MotorStatus != ANGLE_MODE) return;
+  int baseSpeedHz = abs(speedValue);
+  switch(baseSpeedHz){
+    case 0 ... 15:
+      baseSpeedHz = 0;
+      break;
+    case 16 ... 100:
+      baseSpeedHz = 100;
+      break;
+    case 101 ... 200:
+      baseSpeedHz = 200;
+      break;
+    case 201 ... 1000:
+      baseSpeedHz = (map(baseSpeedHz,201,1000,201,1000)/50)*50;
+      break;
+    case 1001 ... 5000:
+      baseSpeedHz = (map(baseSpeedHz,1001,5000,1001,5000)/250)*250;
+      break;
+    case 5001 ... 100000:
+      baseSpeedHz = (map(baseSpeedHz,5001,100000,5001,100000)/1000)*1000;
+      break;
+    default:
+      baseSpeedHz = 10000;
+      break;
+  }
+
+  int speedHz = baseSpeedHz;
+  if (xtoysRampActive && xtoysForceLevel < 5 && stepper) {
+    const float rampFractions[5] = {1.0f, 0.8f, 0.6f, 0.4f, 0.2f};
+    float rampFraction = rampFractions[constrain(xtoysForceLevel, 0, 4)];
+    long rampSteps = max(1L, (long)(xtoysRampTotalSteps * rampFraction));
+    long stepsFromStart = labs(stepper->getCurrentPosition() - xtoysRampStartPosition);
+
+    float t = (float)stepsFromStart / (float)rampSteps;
+    if (t > 1.0f) {
+      t = 1.0f;
+    }
+
+    const float minSpeedFactor = 0.12f;
+    float speedFactor = minSpeedFactor + ((1.0f - minSpeedFactor) * t);
+    speedHz = max(minSpeedHz, (int)(baseSpeedHz * speedFactor));
+
+    if (stepsFromStart >= xtoysRampTotalSteps) {
+      xtoysRampActive = false;
+    }
+  }
+
+  const int threshold = 5; // Minimum distance to move (tune as needed)
+  const int maxStepPerCall = 50; // Maximum steps per call (tune as needed)
+  int distanceToGo = EndPosition - stepper->getCurrentPosition();
+  stepper->setSpeedInHz(speedHz);
+  stepper->setAcceleration(speedHz*1.5);
+  if(abs(distanceToGo)<threshold+maxStepPerCall+1) {
+    stepper->forceStop();
+    //stepper->setCurrentPosition(0);
+    LogDebugPRIO("[GYRO] ANGLE_MODE: distanceToGo < 1, motor stopped. Current position: " + String(stepper->getCurrentPosition()) + ", EndPosition: " + String(EndPosition) + ", distanceToGo: " + String(distanceToGo) );
+    return;
+  }
+  if (abs(distanceToGo) > threshold) {
+    int stepChunk = constrain(abs(distanceToGo), 1, maxStepPerCall);
+    // Clamp stepChunk to not overshoot
+    if (stepChunk > abs(distanceToGo)) {
+      stepChunk = abs(distanceToGo);
+    }
+    int direction = (distanceToGo > 0) ? 1 : -1;
+    stepper->move(direction * stepChunk);
+//    LogDebugPRIO("[GYRO] Moving: stepChunk=" + String(stepChunk) + ", direction=" + String(direction) + ", EndPosition=" + String(EndPosition) + ", CurrentPosition=" + String(stepper->getCurrentPosition()));
+    // After move, check if we've reached or passed EndPosition
+    int newPos = stepper->getCurrentPosition() + direction * stepChunk;
+    if ((direction > 0 && newPos >= EndPosition) || (direction < 0 && newPos <= EndPosition)) {
+      stepper->forceStop();
+      stepper->setCurrentPosition(EndPosition);
+      LogDebugPRIO("[GYRO] Clamped to EndPosition: " + String(EndPosition));
+    }
+  } else {
+    // Already at or very close to EndPosition
+    stepper->forceStop();
+    stepper->setCurrentPosition(EndPosition);
+//    LogDebugPRIO("[GYRO] At EndPosition: " + String(EndPosition));
+  }
+  LogDebugPRIO("Speedvalue: " + String(abs(speedHz)) +", EndPosition: " + String(EndPosition) + ", CurrentPosition: " + String(stepper->getCurrentPosition()) + ", DistanceToGo: " + String((distanceToGo))  );
+  delay(20);
+}
+
+void moveFromGyroNEWTRY(){
+  if (MotorStatus != ANGLE_MODE) return;
+
+  #define SPEED_HISTORY_SIZE 50
+static int speedHistory[SPEED_HISTORY_SIZE];
+static unsigned long timeHistory[SPEED_HISTORY_SIZE];
+static int speedIndex = 0;
+
+// At the start of moveFromGyro:
+speedHistory[speedIndex] = speedValue;
+timeHistory[speedIndex] = millis();
+speedIndex = (speedIndex + 1) % SPEED_HISTORY_SIZE;
+
+// Calculate average of last 1000ms:
+unsigned long now = millis();
+int sum = 0, count = 0;
+for (int i = 0; i < SPEED_HISTORY_SIZE; ++i) {
+    if (now - timeHistory[i] <= 1000) {
+        sum += speedHistory[i];
+        count++;
+    }
+}
+int speedHz = (count > 0) ? abs(sum / count) : 0;
+
+//  int speedHz = abs(speedValue);
+  switch(speedHz){
+    case 0 ... 5:
+      speedHz = 0;
+      break;
+    case 6 ... 100:
+      speedHz = 100;
+      break;
+    case 101 ... 200:
+      speedHz = 200;
+      break;
+    case 201 ... 1000:
+      speedHz = (map(speedHz,201,1000,201,1000)/50)*50;
+      break;
+    case 1001 ... 5000:
+      speedHz = (map(speedHz,1001,5000,1001,5000)/250)*250;
+      break;
+    case 5001 ... 50000:
+      speedHz = (map(speedHz,5001,10000,5001,10000)/1000)*1000;
+      break;
+    default:
+      speedHz = 50000;
+      break;
+  }
+  const int threshold = 5; // Minimum distance to move (tune as needed)
+  const int maxStepPerCall = 20; // Maximum steps per call (tune as needed)
+  int distanceToGo = EndPosition - stepper->getCurrentPosition();
+  stepper->setSpeedInHz(speedHz);
+  stepper->setAcceleration(speedHz*0.9);
+  if(abs(distanceToGo)<threshold+maxStepPerCall+1) {
+    if(distanceToGo<0) {
+      //stepper->moveTo(stepper->getCurrentPosition());
+      stepper->forceStop();
+    } else if (distanceToGo>0) {
+      //stepper->moveTo(stepper->getCurrentPosition());
+      stepper->forceStop();
+    }
+    stepper->forceStop();
+    //stepper->setCurrentPosition(0);
+    LogDebugPRIO("[GYRO] ANGLE_MODE: distanceToGo < 1, motor stopped. Current position: " + String(stepper->getCurrentPosition()) + ", EndPosition: " + String(EndPosition) + ", distanceToGo: " + String(distanceToGo) );
+    return;
+  }
+  if (abs(distanceToGo) > threshold) {
+    int stepChunk = constrain(abs(distanceToGo), 1, maxStepPerCall);
+    // Clamp stepChunk to not overshoot
+    if (stepChunk > abs(distanceToGo)) {
+      stepChunk = abs(distanceToGo);
+    }
+    int direction = (distanceToGo > 0) ? 1 : -1;
+    stepper->move(direction * stepChunk);
+//    LogDebugPRIO("[GYRO] Moving: stepChunk=" + String(stepChunk) + ", direction=" + String(direction) + ", EndPosition=" + String(EndPosition) + ", CurrentPosition=" + String(stepper->getCurrentPosition()));
+    // After move, check if we've reached or passed EndPosition
+    int newPos = stepper->getCurrentPosition() + direction * stepChunk;
+    if ((direction > 0 && newPos >= EndPosition) || (direction < 0 && newPos <= EndPosition)) {
+      stepper->forceStop();
+      stepper->setCurrentPosition(EndPosition);
+      LogDebugPRIO("[GYRO] Clamped to EndPosition: " + String(EndPosition));
+    }
+  } else {
+    // Already at or very close to EndPosition
+    stepper->forceStop();
+    stepper->setCurrentPosition(EndPosition);
+//    LogDebugPRIO("[GYRO] At EndPosition: " + String(EndPosition));
+  }
+  LogDebugPRIO("Speedvalue: " + String(abs(speedHz)) +", EndPosition: " + String(EndPosition) + ", CurrentPosition: " + String(stepper->getCurrentPosition()) + ", DistanceToGo: " + String((distanceToGo))  );
+  delay(20);
+}
+
+
+
+void moveFromGyroWorkingOK(){
+  if(abs(speedValue)>lastspeed) {
+    lastspeed=speedValue;
+  }
+  //LogDebugPRIO("Max speed value = " + String(lastspeed));
+  if (MotorStatus != ANGLE_MODE) return;
+  int speedHz = abs(speedValue);
+  switch(speedHz){
+    case 0 ... 100:
+      speedHz = 100;
+      break;
+    case 101 ... 200:
+      speedHz = 200;
+    //      speedHz = (map(speedHz,101,200,101,200)/50)*50;
+      break;
+    case 201 ... 1000:
+      speedHz = 1000;
+      //      speedHz = (map(speedHz,201,1000,201,1000)/50)*50;
+      break;
+    case 1001 ... 5000:
+      speedHz = (map(speedHz,1001,5000,1001,5000)/1000)*1000;
+      break;
+    case 5001 ... 10000:
+      speedHz = (map(speedHz,5001,10000,5001,10000)/1000)*1000;
+      break;
+    default:
+      speedHz = 10000;
+      break;
+  }
+  int distanceToGo = EndPosition - stepper->getCurrentPosition();
+  stepper->setSpeedInHz(speedHz);
+  stepper->setAcceleration(speedHz*1.5);
+  if(!stepper->isRunning()){
+    if(abs(distanceToGo)>0) stepper->moveTo(EndPosition*-1);
+    LogDebugPRIO("Speedvalue: " + String(abs(speedHz)) +"    EndPosition: " + String(EndPosition) + ", CurrentPosition: " + String(stepper->getCurrentPosition()) );
+  } else {
+    if(abs(distanceToGo) < 1){
+      stepper->moveTo(EndPosition);
+      LogDebugPRIO("Speedvalue: " + String(abs(speedHz)) +"    EndPosition: " + String(EndPosition) + ", CurrentPosition: " + String(stepper->getCurrentPosition()) );
+      Serial.println();
+    }
+  }
+
+}
+
+void loop(void) {
+
+  if (!ESPNOW_ONLY_MODE) {
+    xtoysWebSocket.loop();
+    if (strlen(XTOYS_WEBHOOK_ID) > 0) {
+      handleAutoModeTransitions();
+    }
+    broadcastXToysStatus();
+  }
+
+
+  if (MotorStatus==STOP){
+  stepper->forceStop();
+  LogDebug("MOTOR STOPPED");
+  MotorStatus=IDLE;
+  } else{
+      moveFromM5Remote();
+      
+      //moveFromGyro();
+      moveFromGyro();
+    }
+}
+
+ /////////////////////////////////OTA code/////////////////////////////////////
+
+//  server.handleClient();
+//  ElegantOTA.loop();

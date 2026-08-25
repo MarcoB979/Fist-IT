@@ -129,7 +129,8 @@ uint8_t M5_Remote_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 //uint8_t M5_Remote_Address[] = {0xB0, 0xB2, 0x1C, 0x50, 0xF6, 0xDC};
 
 // OSSM STROKE ENGINE CONNECTION
-uint8_t OSSM_Address[] = {0xC0, 0x5D, 0x89, 0xB3, 0xDA, 0xFC}; // OSSM MAC address from M5 Remote code
+//uint8_t OSSM_Address[] = {0xC0, 0x5D, 0x89, 0xB3, 0xDA, 0xFC}; // OSSM MAC address from M5 Remote code
+uint8_t OSSM_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // OSSM MAC address from M5 Remote code
 uint8_t FIST_IT_RC_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Fist-IT Remote Controller address
 
 #define OFF 10
@@ -146,26 +147,27 @@ uint8_t FIST_IT_RC_Address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Fist-IT 
 
 // Uncomment the following line if you wish to print DEBUG info
 
-//#define DEBUG 
+#define DEBUG 
 
 #ifdef DEBUG
-#define LogDebug(...) LogDebug(__VA_ARGS__)
-#define LogDebugFormatted(...) LogDebugFormatted(__VA_ARGS__)
+#define LogDebug(...) Serial.println(__VA_ARGS__)
+#define LogDebugFormatted(...) Serial.printf(__VA_ARGS__)
 #else
 #define LogDebug(...) ((void)0)
 #define LogDebugFormatted(...) ((void)0)
 #endif
 
 // Uncomment the following line if you wish to print DEBUG info
-//#define DEBUGPRIO 
+#define DEBUGPRIO 
 
 #ifdef DEBUGPRIO
-#define LogDebugPRIO(...) LogDebug(__VA_ARGS__)
-#define LogDebugFormattedPRIO(...) LogDebugFormatted(__VA_ARGS__)
+#define LogDebugPRIO(...) Serial.println(__VA_ARGS__)
+#define LogDebugFormattedPRIO(...) Serial.printf(__VA_ARGS__)
 #else
 #define LogDebugPRIO(...) ((void)0)
 #define LogDebugFormattedPRIO(...) ((void)0)
 #endif
+
 
 
 // Variable to store if sending data was successful
@@ -263,56 +265,16 @@ void onOTAEnd(bool success) {
 
 /////////////////////////////////OTA Callbacks/////////////////////////////////////
 
-// OSSM STROKE ENGINE COMMUNICATION
-bool SendOSSMCommand(int command, float value) {
-  if (!OSSM_paired) {
-    LogDebug("OSSM not paired - attempting to connect");
-    
-    // Try to pair with OSSM by sending heartbeat
-    struct_message ossmMessage;
-    memset(&ossmMessage, 0, sizeof(ossmMessage));
-    ossmMessage.esp_command = HEARTBEAT;
-    ossmMessage.esp_heartbeat = true;
-    ossmMessage.esp_target = OSSM_ID;
-    ossmMessage.esp_sender = FIST_ID;
-    
-    esp_err_t result = esp_now_send(OSSM_Address, (uint8_t *) &ossmMessage, sizeof(ossmMessage));
-    if (result == ESP_OK) {
-      LogDebug("OSSM heartbeat sent for pairing");
-    }
-    return false;
-  }
-  
-  // Send command to paired OSSM
-  struct_message ossmMessage;
-  memset(&ossmMessage, 0, sizeof(ossmMessage));
-  ossmMessage.esp_connected = true;
-  ossmMessage.esp_command = command;
-  ossmMessage.esp_value = value;
-  ossmMessage.esp_target = OSSM_ID;
-  ossmMessage.esp_sender = FIST_ID;
-  
-  esp_err_t result = esp_now_send(OSSM_Address, (uint8_t *) &ossmMessage, sizeof(ossmMessage));
-  if (result == ESP_OK) {
-    LogDebugFormatted("OSSM command sent: CMD=%d, VALUE=%.2f\n", command, value);
-    return true;
-  } else {
-    LogDebugFormatted("Failed to send OSSM command: CMD=%d\n", command);
-    return false;
-  }
-}
-
-
 // Callback when data is sent
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-/*
-  LogDebugFormatted("\r\nLast Packet Send Status:\t");
-  LogDebugFormatted(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
-  LogDebugFormatted("Targert MAC addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+
+  LogDebugFormatted("\nLast Packet Send Status: %s", status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+  LogDebugFormatted("Target MAC addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
   LogDebugFormatted("outgoing target ID : %d\n", outgoingcontrol.esp_target);
   LogDebugFormatted("outgoing sender ID : %d\n", outgoingcontrol.esp_sender);
   LogDebugFormatted("outgoing command : %d\n", outgoingcontrol.esp_command);
-*/
+  LogDebugFormatted("outgoing value : %.2f\n", outgoingcontrol.esp_value);
+  LogDebugFormatted("sent on channel : %d\n", WiFi.channel());
 
   if (status ==0){
     success = "Delivery Success :)";
@@ -324,26 +286,21 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 
 // Callback when data is received
 void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
-LogDebug("Received step 1");
+  LogDebug("Received step 1");
   memcpy(&incomingcontrol, incomingData, sizeof(incomingcontrol));
-/*
-  LogDebug("Received Command: ");
-  LogDebug(incomingcontrol.esp_command);
-  LogDebug("Received value: ");
-  LogDebug(incomingcontrol.esp_value);
-  LogDebug("Received to target ID: ");
-  LogDebug(incomingcontrol.esp_target);
-  LogDebug("Received from sender: ");
-  LogDebug(incomingcontrol.esp_sender);
-  LogDebugFormatted("from MAC addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-*/
 
-  // SMART PEER MANAGEMENT: Only add peer if not already paired
-  if(incomingcontrol.esp_target == FIST_ID) {
-    
+  LogDebugFormatted("Received Command: %d, value: %.2f, To Target ID: %d, from sender ID: %d", incomingcontrol.esp_command, incomingcontrol.esp_value, incomingcontrol.esp_target, incomingcontrol.esp_sender);
+  LogDebugFormatted("Sender MAC addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+  if(incomingcontrol.esp_target != FIST_ID && incomingcontrol.esp_target != 0) {
+    LogDebugFormatted("Received ESP-NOW data not intended for this device (target ID: %d), ignoring.", incomingcontrol.esp_target);
+    return; 
+  }
+  
     bool needToAddPeer = false;
     
     if (incomingcontrol.esp_sender == M5_ID && !M5_paired) {
+      LogDebug("Sender is M5 and not paired");
       // M5 Remote trying to connect for first time
       esp_now_del_peer(peerInfo.peer_addr); // Clear any existing peer
       memcpy(M5_Remote_Address, mac, 6);
@@ -352,6 +309,7 @@ LogDebug("Received step 1");
       LogDebugPRIO("Setting up M5 Remote peer");
     }
     else if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID && !FIST_IT_RC_paired) {
+      LogDebug("Sender is Fist-IT Gyro and not paired");
       // Fist-IT RC trying to connect for first time
       esp_now_del_peer(peerInfo.peer_addr); // Clear any existing peer
       memcpy(FIST_IT_RC_Address, mac, 6);
@@ -362,18 +320,21 @@ LogDebug("Received step 1");
                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
     else if (incomingcontrol.esp_sender == M5_ID && M5_paired) {
+      LogDebug("Sender is M5 and already paired");
       // M5 is already paired, just switch to its peer address
       memcpy(peerInfo.peer_addr, M5_Remote_Address, 6);
       LogDebugPRIO("Switching to M5 Remote peer");
     }
     else if (incomingcontrol.esp_sender == FIST_IT_GYRO_ID && FIST_IT_RC_paired) {
+      LogDebug("Sender is Fist-IT Gyro and already paired");
       // Fist-IT RC is already paired, just switch to its peer address
       memcpy(peerInfo.peer_addr, FIST_IT_RC_Address, 6);
       LogDebugPRIO("Switching to Fist-IT RC peer");
     }
     
     if (needToAddPeer) {
-      peerInfo.channel = 0;
+      LogDebugFormattedPRIO("Adding new peer for sender ID: %d on channel %d\n", incomingcontrol.esp_sender, WiFi.channel());
+      peerInfo.channel = WiFi.channel(); // Use current Wi-Fi channel
       peerInfo.encrypt = false;
       
       esp_err_t result = esp_now_add_peer(&peerInfo);
@@ -398,12 +359,12 @@ LogDebug("Received step 1");
         LogDebugPRIO("Failed to add peer");
       }
     }
+    
+  // SMART PEER MANAGEMENT: Only add peer if not already paired
+  if(incomingcontrol.esp_target == FIST_ID) {
 
     // Process commands from any paired device
-    LogDebug("Received command ");
-    LogDebug(incomingcontrol.esp_command);
-    LogDebug("Received value ");
-    LogDebug(incomingcontrol.esp_value);
+    LogDebugFormatted("Received command FOR FIST-IT from paired device: %d, value %.2f\n", incomingcontrol.esp_command, incomingcontrol.esp_value);
     
     // ALWAYS ALLOW CONNECTION COMMANDS - they establish communication
     if (incomingcontrol.esp_command == CONNECT) {
@@ -436,6 +397,7 @@ LogDebug("Received step 1");
     
     // ALWAYS SEND ACKNOWLEDGMENTS FOR CONNECTION HEARTBEATS
     if (incomingcontrol.esp_heartbeat) {
+      LogDebugFormatted("HEARTBEAT received from device %d. replying with heartbeat\n", incomingcontrol.esp_sender);
       // Send heartbeat response to confirm connection is alive
       outgoingcontrol.esp_heartbeat = true;
       outgoingcontrol.esp_connected = true;
@@ -823,80 +785,69 @@ LogDebug("Received step 1");
 
 
 // Initialize ESP-NOW communication
-void setupESPNow() {
-    // WiFi setup is now done during splash screen, so skip setupWiFiManager()
-    
-    // Get the actual WiFi channel and use it for ESP-NOW
-    int32_t actualChannel;
-    if (WiFi.status() == WL_CONNECTED) {
-        actualChannel = WiFi.channel();
-        LogDebugFormattedPRIO("WiFi network '%s' is on channel: %d\n", WiFi.SSID().c_str(), actualChannel);
-    } else {
-        // If not connected to WiFi, use default channel 1
-        actualChannel = 1;
-        LogDebugPRIO("WiFi not connected, using default channel 1 for ESP-NOW");
-    }
-    
-    actualChannel = 1; // Force channel 1 for compatibility with Fist-IT Motor
+void setupESPNow()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);   // not associated to AP
+  esp_wifi_stop();
+  esp_wifi_start();
 
-    // Set ESP-NOW to use the determined channel
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(actualChannel, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(false);
-    
-    LogDebugFormattedPRIO("ESP-NOW channel set to: %d (matches WiFi)\n", actualChannel);
-    
-    // Print our own MAC address for reference
-    //Serial.print("Fist-IT Gyro Controller MAC: ");
-    LogDebugPRIO(WiFi.macAddress());
-    
-    // Initialize ESP-NOW
-    //Serial.print("Initializing ESP-NOW... ");
+  // Explicitly set the WiFi channel to 1 before ESP-NOW init.
+  // Without this, the radio stays on channel 0 (unset) and broadcast
+  // packets are never received by devices on channel 1 (OSSM, Eject, FistIT).
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  LogDebug(WiFi.macAddress());
     if (esp_now_init() != ESP_OK) {
-        LogDebug("Error initializing ESP-NOW");
-        return;
+    Serial.println("Error initializing ESP-NOW");
+    return;
     }
-    LogDebug("Success!");
-    
-    // Register callback functions
-      esp_now_register_send_cb(OnDataSent);
-  
-      // Initialize single dynamic peer info structure
-      memset(&peerInfo, 0, sizeof(peerInfo));
-      peerInfo.channel = 0;  
-      peerInfo.encrypt = false;
-    
-      // Register for a callback function that will be called when data is received
-      esp_now_register_recv_cb(OnDataRecv);
-    
-    // Set up broadcast peer for initial discovery
-    memset(&peerInfo, 0, sizeof(peerInfo));
-    uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-    peerInfo.channel = 0;  
-    peerInfo.encrypt = false;
-    
-    // Add broadcast peer
-    esp_err_t peerResult = esp_now_add_peer(&peerInfo);
-    if (peerResult != ESP_OK) {
-        LogDebugFormatted("Failed to add broadcast peer, error: %d\n", peerResult);
-        return;
-    }
-    
-    LogDebugPRIO("ESP-NOW initialized with broadcast peer");
-    LogDebug("Sending discovery messages to find devices...");
-    
+
+  esp_now_peer_info_t peerInfo{};
+  memcpy(peerInfo.peer_addr, DEFAULT_Address, 6);
+  peerInfo.channel = 1;              // lock peer to ch1
+  peerInfo.encrypt = false;
+  // Add peer        
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Failed to add peer");
+  }
+
+  // Once ESPNow is successfully Init, we will register for Send CB to
+  // get the status of Trasnmitted packet
+  esp_now_register_send_cb(OnDataSent);
+  // Register for a callback function that will be called when data is received
+  esp_now_register_recv_cb(OnDataRecv);
 }
+
 
 void setup(void) {
   Serial.begin(115200);
-
+  delay(1000);
+/*
   WiFi.mode(WIFI_AP_STA);
-  LogDebug(WiFi.channel());
-  WiFi.printDiag(Serial);
-  MDNS.begin("fist-it");
+  //WiFi.printDiag(Serial);
+  //MDNS.begin("fist-it");
+  WiFi.begin("Bechthum", "Marco-1979");
 
+  // Wait up to 10 seconds for WiFi connection, then continue startup.
+  const unsigned long wifiConnectTimeoutMs = 10000;
+  const unsigned long wifiWaitStart = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - wifiWaitStart) < wifiConnectTimeoutMs) {
+    delay(100);
+  }
 
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WARNING: WiFi not connected after 10s, continuing startup.");
+  }
+
+*/
+
+/*
   // WiFiManager setup for automatic network configuration
   // WiFiManager wifiManager;
   // WiFi.setHostname("fist-it");
@@ -919,7 +870,7 @@ void setup(void) {
     LogDebug("Connected to WiFi on channel: ");
     LogDebug(actualChannel);
     LogDebug(WiFi.channel());   
-    WiFi.printDiag(Serial);
+    //WiFi.printDiag(Serial);
 
     LogDebug("Starting Fist-IT Gyro Controller Setup"); 
 
@@ -930,9 +881,12 @@ void setup(void) {
     esp_wifi_set_channel(actualChannel, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
     LogDebug(WiFi.channel());
-    WiFi.printDiag(Serial);
-    // Now set up ESP-NOW
-    setupESPNow();
+    //WiFi.printDiag(Serial);
+
+*/
+
+  // Now set up ESP-NOW
+  setupESPNow();
 
   
   pinMode(enablePinStepper, OUTPUT);
@@ -984,7 +938,7 @@ void setup(void) {
         outgoingcontrol.esp_sender = FIST_ID;
         esp_err_t result = esp_now_send(M5_Remote_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
         if (result == !ESP_OK) {
-          LogDebug("Sending to M5 failed (not paired)");
+          LogDebug("Sending to M5 failed (NO PEER)");
         }
   
       }
@@ -1092,7 +1046,7 @@ void setupOLD(void) {
   
       // Initialize single dynamic peer info structure
       memset(&peerInfo, 0, sizeof(peerInfo));
-      peerInfo.channel = 0;  
+      peerInfo.channel = actualChannel;
       peerInfo.encrypt = false;
     
       // Register for a callback function that will be called when data is received
@@ -1175,14 +1129,14 @@ void espNowRemoteTask(void *pvParameters)
       //CheckAllPeers;
       if(M5_paired){
       LogDebug("Heartbeat M5");
-//      LogDebugFormatted("OSSM addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", OSSM_Address[0], OSSM_Address[1], OSSM_Address[2], OSSM_Address[3], OSSM_Address[4], OSSM_Address[5]);
+      LogDebugFormatted("OSSM addresss : %02X:%02X:%02X:%02X:%02X:%02X\n", OSSM_Address[0], OSSM_Address[1], OSSM_Address[2], OSSM_Address[3], OSSM_Address[4], OSSM_Address[5]);
       outgoingcontrol.esp_command = HEARTBEAT;
       outgoingcontrol.esp_sender = FIST_ID;
       outgoingcontrol.esp_heartbeat = true;
       outgoingcontrol.esp_target = M5_ID;
       esp_err_t result = esp_now_send(M5_Remote_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
       if (result == ESP_OK) {
-//        LogDebug("Sent ok");
+        LogDebug("Sent ok");
       } 
       else {
         LogDebug("failed to send heartbeat");
@@ -1206,15 +1160,13 @@ void espNowRemoteTask(void *pvParameters)
     }
     
     delay(200);
-    LogDebug("Heartbeat ALL");
-    LogDebugFormatted("on wifi channel : %d\n", WiFi.channel());
     outgoingcontrol.esp_command = HEARTBEAT;
     outgoingcontrol.esp_sender = FIST_ID;
     outgoingcontrol.esp_heartbeat = true;
-    outgoingcontrol.esp_target = FIST_IT_GYRO_ID;  // Target FIST_IT_GYRO_ID for discovery pairing
+    outgoingcontrol.esp_target = M5_ID;  // Target M5_ID for discovery pairing
     esp_err_t result = esp_now_send(DEFAULT_Address, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
     //StatusMessageOut();
-
+    LogDebugFormatted("Sent heartbeat to default broadcast address: %02X:%02X:%02X:%02X:%02X:%02X. The delivery %s\n", DEFAULT_Address[0], DEFAULT_Address[1], DEFAULT_Address[2], DEFAULT_Address[3], DEFAULT_Address[4], DEFAULT_Address[5], (result == ESP_OK) ? "was successful" : "failed");
     //problem when adding if Fist-IT not paired
     vTaskDelay(HEARTBEAT_INTERVAL);
   }

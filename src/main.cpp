@@ -7,6 +7,8 @@
 #include <WiFi.h>
 #include <wifi.h>
 #include <NimBLEDevice.h>
+#include "fist_protocol.h"
+#include "xtoys-webhook.h"
 #if defined(ESP32)
 #include <esp_log.h>
 #endif
@@ -96,6 +98,8 @@ int speedValue =1;
 int stepsPerRotation = 3600;
 int SensationValue = 100;
 int F_Pause = 0;
+bool strokePauseActive = false;
+unsigned long strokePauseStartMs = 0;
 int strokeSpeedSetting = 1;
 int strokeAccelSetting = 100;
 int START=1;
@@ -119,35 +123,7 @@ const int STROKE_ACCEL_MAX_VALUE = 25000;
 // 1.0 means accel equals speed (roughly 1 second to reach target speed).
 const float STROKE_ACCEL_SPEED_MULTIPLIER = 1.0f;
 
-#define FSPEED  30
-#define FROTATION   31
-#define FPAUSE   32
-#define FSENSATION  33
-#define FANGLE  34
-#define FROTATION_SCALE  35   // Set rotation amplification (1-4x)
-#define FRESPONSIVENESS  36   // Set speed responsiveness: 1=Normal(0.7x), 2=Fast(2.5x), 3=Ultra(5x)
-#define FVELOCITY  37   // Rotation velocity for dynamic speed control
-#define FSTOP  38   // Safety stop command (1=STOP/SAFE, 0=GO/ACTIVE)
-
-// OSSM STROKE ENGINE COMMANDS (from M5 Remote)
-#define SPEED 1
-#define DEPTH 2
-#define STROKE 3
-#define SENSATION 4
-#define PATTERN 5
-#define HEARTBEAT 99
-#define CONNECT 88
-
-#define OSSM_ID  1 //OSSM_ID Default can be changed with M5 Remote in the Future will be Saved in EPROOM
-#define FIST_ID 3 //M5_ID Default can be changed with M5 Remote in the Future will be Saved in EPROOM
-#define FIST_IT_GYRO_ID 4 //Fist-IT Gyro Controller ID
-#define M5_ID 99 //M5_ID Default can be changed with M5 Remote in the Future will be Saved in EPROOM
-
-#define OFF 10
-#define ON  11
-
-#define CONNECT 88
-#define HEARTBEAT 99
+// Command States, IDs and struct_message are shared via fist_protocol.h
 
 ///////////////////////////////////////////
 ////
@@ -157,7 +133,7 @@ const float STROKE_ACCEL_SPEED_MULTIPLIER = 1.0f;
 
 // Uncomment the following line if you wish to print DEBUG info
 
-#define DEBUG 
+//#define DEBUG 
 
 #ifdef DEBUG
 #define LogDebug(...) Serial.println(__VA_ARGS__)
@@ -172,10 +148,10 @@ const float STROKE_ACCEL_SPEED_MULTIPLIER = 1.0f;
 
 #ifdef DEBUGPRIO
 #define LogDebugPRIO(...) Serial.println(__VA_ARGS__)
-#define LogDebugFormattedPRIO(...) Serial.printf(__VA_ARGS__)
+#define LogDebugPRIOFormatted(...) Serial.printf(__VA_ARGS__)
 #else
 #define LogDebugPRIO(...) ((void)0)
-#define LogDebugFormattedPRIO(...) ((void)0)
+#define LogDebugPRIOFormatted(...) ((void)0)
 #endif
 
 
@@ -206,20 +182,7 @@ bool incoming_heartbeat;
 int incoming_target;
 int incoming_sender;
 
-typedef struct struct_message {
-  float speed;
-  float depth;
-  float stroke;
-  float sensation;
-  float pattern;
-  bool rstate;
-  bool connected;
-  bool heartbeat;
-  int command;
-  float value;
-  int target;
-  int sender;
-} struct_message;
+// struct_message is shared via fist_protocol.h
 
 bool M5_paired = false;
 bool FIST_IT_RC_paired = false;
@@ -268,7 +231,7 @@ void onOTAProgress(size_t current, size_t final) {
   // Log every 1 second
   if (millis() - ota_progress_millis > 1000) {
     ota_progress_millis = millis();
-    LogDebugFormattedPRIO("OTA Progress Current: %u bytes, Final: %u bytes\n", current, final);
+    LogDebugPRIOFormatted("OTA Progress Current: %u bytes, Final: %u bytes\n", current, final);
   }
 }
 
@@ -285,6 +248,8 @@ void onOTAEnd(bool success) {
 /////////////////////////////////OTA Callbacks/////////////////////////////////////
 
 static bool sendBleMessage(const struct_message &msg) {
+  xtoysSendMessage(msg);
+
   if (!g_bleClientConnected || g_bleTxChar == nullptr) {
     LogDebugFormatted("BLE TX SKIP cmd=%d val=%.3f target=%d sender=%d connected=%d heartbeat=%d\\n",
                       msg.command,
@@ -395,10 +360,10 @@ void OnDataRecv() {
 
   if (incoming.sender == M5_ID && !M5_paired) {
     M5_paired = true;
-    LogDebugPRIO("M5 Remote Connected over BLE");
+    LogDebug("M5 Remote Connected over BLE");
   } else if (incoming.sender == FIST_IT_GYRO_ID && !FIST_IT_RC_paired) {
     FIST_IT_RC_paired = true;
-    LogDebugPRIO("Fist-IT RC Connected over BLE");
+    LogDebug("Fist-IT RC Connected over BLE");
   }
     
   // SMART PEER MANAGEMENT: Only add peer if not already paired
@@ -445,7 +410,7 @@ void OnDataRecv() {
       outgoing.target = incoming.sender;
       outgoing.sender = FIST_ID;
       sendBleMessage(outgoing);
-      LogDebugFormattedPRIO("Heartbeat response sent to device %d\n", incoming.sender);
+      LogDebugFormatted("Heartbeat response sent to device %d\n", incoming.sender);
     }
     
     // SAFETY SYSTEM: Check if movement commands should be processed
@@ -759,11 +724,13 @@ void OnDataRecv() {
         LogDebug(speedValue);   
         LogDebug("Sensation Value: ");
         LogDebug(SensationValue); 
+        strokePauseActive = false;
         MotorStatus=START;
       }
       break;
       case OFF:
       {
+        strokePauseActive = false;
         MotorStatus=STOP;
       }
       break;
@@ -780,7 +747,7 @@ void OnDataRecv() {
           
           if (result) {
             M5_paired = true;
-            LogDebug("M5 remote Connected");
+            LogDebugPRIO("M5 remote Connected");
           }
         }
         // Handle connection from Fist-IT Remote Controller
@@ -858,6 +825,7 @@ void setup(void) {
 
   // Initialize BLE transport for M5 Remote communication.
   setupBLEComm();
+  setupXtoysWebhook();
 
   
   pinMode(enablePinStepper, OUTPUT);
@@ -898,6 +866,8 @@ void setup(void) {
 }
 
 void pollBLEComm() {
+  xtoysWebhookLoop();
+
   if (g_bleMessagePending) {
     g_bleMessagePending = false;
     OnDataRecv();
@@ -940,26 +910,85 @@ int finalAccel = calculateStrokeAccelFromSpeed(commandedAccel, finalSpeedSps);
 
 stepper->setSpeedInTicks(finalSpeedTickUs);
 stepper->setAcceleration(finalAccel);
-LogDebugFormatted("Motor Speed: %d sps (tick_us=%d), Accel: %d steps/s^2, SpeedSetting: %d, AccelSetting: %d, StrokeSteps: %d\n",
-                  finalSpeedSps,
-                  finalSpeedTickUs,
-                  finalAccel,
-                  strokeSpeedSetting,
-                  strokeAccelSetting,
-                  strokeDistanceSteps);
+static unsigned long lastMotorDebugMs = 0;
+if (millis() - lastMotorDebugMs >= 250) {
+  lastMotorDebugMs = millis();
+  LogDebugFormatted("Motor Speed: %d sps (tick_us=%d), Accel: %d steps/s^2, SpeedSetting: %d, AccelSetting: %d, StrokeSteps: %d\n",
+                    finalSpeedSps,
+                    finalSpeedTickUs,
+                    finalAccel,
+                    strokeSpeedSetting,
+                    strokeAccelSetting,
+                    strokeDistanceSteps);
+}
+//================================================
+/*
 if (stepper->targetPos()==stepper->getCurrentPosition()) {
-  //delay((F_Pause*100)+1); //pause in ms
-  if (stepper->getCurrentPosition()==StartPosition) {
-      stepper->moveTo(EndPosition);
-      }else      
-      if (stepper->getCurrentPosition()==EndPosition) {
-        stepper->moveTo(StartPosition);
-      }else      
-      if (stepper->getCurrentPosition()<EndPosition) {
+  // Wait F_Pause tenths-of-a-second at each end before reversing direction.
+  if (!strokePauseActive) {
+    strokePauseActive = true;
+    strokePauseStartMs = millis();
+    LogDebugPRIOFormatted("[Pause] Reached pos=%ld, waiting %lu ms (F_Pause=%d)\n",
+                      (long)stepper->getCurrentPosition(), (unsigned long)F_Pause * 100UL, F_Pause);
+  }
+  if ((millis() - strokePauseStartMs) >= (unsigned long)F_Pause * 100UL) {
+    strokePauseActive = false;
+    LogDebugPRIOFormatted("[Pause] Done after %lu ms, reversing from pos=%ld\n",
+                      millis() - strokePauseStartMs, (long)stepper->getCurrentPosition());
+    if (stepper->getCurrentPosition()==StartPosition) {
         stepper->moveTo(EndPosition);
-      }else      
+        }else      
+        if (stepper->getCurrentPosition()==EndPosition) {
+          stepper->moveTo(StartPosition);
+        }else      
+        if (stepper->getCurrentPosition()<EndPosition) {
+          stepper->moveTo(EndPosition);
+        }else      
+          stepper->moveTo(EndPosition);
+    } else {
+      // Still waiting for pause to complete
+      LogDebugPRIOFormatted("[Pause] Waiting... %lu ms elapsed (F_Pause=%d)\n",
+                        millis() - strokePauseStartMs, F_Pause);
+      }
+  }
+*/
+//================================================
+
+//************************* */
+if (!stepper->isRunning()) {
+  
+  // Wait F_Pause tenths-of-a-second at each end before reversing direction.
+  if (!strokePauseActive) {
+    strokePauseActive = true;
+    strokePauseStartMs = millis(); // De timer start NU PAS exact bij stilstand!
+    LogDebugPRIOFormatted("[Pause] Reached pos=%ld, waiting %lu ms (F_Pause=%d)\n",
+                      (long)stepper->getCurrentPosition(), (unsigned long)F_Pause * 100UL, F_Pause);
+  }
+  
+  // Controleer of de pauzetijd volledig is verstreken
+  if ((millis() - strokePauseStartMs) >= (unsigned long)F_Pause * 100UL) {
+    strokePauseActive = false;
+    LogDebugPRIOFormatted("[Pause] Done after %lu ms, reversing from pos=%ld\n",
+                      millis() - strokePauseStartMs, (long)stepper->getCurrentPosition());
+    
+    // Richting omkeren op basis van de huidige positie
+    if (stepper->getCurrentPosition() == StartPosition) {
+        stepper->moveTo(EndPosition);
+    } else if (stepper->getCurrentPosition() == EndPosition) {
+        stepper->moveTo(StartPosition);
+    } else if (stepper->getCurrentPosition() < EndPosition) {
+        stepper->moveTo(EndPosition);
+    } else {
         stepper->moveTo(EndPosition);
     }
+  } else {
+    // Still waiting for pause to complete
+    LogDebugPRIOFormatted("[Pause] Waiting... %lu ms elapsed (F_Pause=%d)\n",
+                      millis() - strokePauseStartMs, F_Pause);
+  }
+}
+//************************* */
+
   }  
 /*    
     if (stepper->targetPos()==stepper->getCurrentPosition()) {
@@ -985,7 +1014,7 @@ if (stepper->targetPos()==stepper->getCurrentPosition()) {
 
 else if (MotorStatus==STOP){
   stepper->forceStop();
-  LogDebug("MOTOR STOPPED");
+  LogDebugPRIO("MOTOR STOPPED");
   MotorStatus=IDLE;
   }
 
